@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Algo 3: stacked skip-connected shadow net, one small block per model layer, trained online with Adam.
+
+State s [H] runs alongside the model. Block L mixes in 1-3 layers of current and past activations:
+    u = proj_L([x_L, x_{L-1}, prev-token x_{L+1}, prev-token x_{L+2}])     (RMS-normalised, missing ones = 0)
+    s = s + down_L(silu(gate_L([s, u])) * up_L([s, u]))
+Head (L, k) predicts a residual on the router of L+k applied to x_L (zero-init). Loss: MSE to the real
+router logits of every target, backprop through the whole stack each token.
+"""
+import time
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from common import cli, load, report
+
+
+def rms(x):
+    return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)
+
+
+def main():
+    ap = cli(__doc__)
+    ap.add_argument("--ahead", type=int, default=3)
+    ap.add_argument("--hidden", type=int, default=256)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    a = ap.parse_args()
+    d = load(a.data, need_x=True)
+    dev = "cuda"
+    X = d["X"].to(dev)
+    Y, W, real, K = d["Y"].to(dev), d["W"].to(dev), d["real"].to(dev), d["k"]
+    NL, T, D = X.shape
+    E, H, A = W.shape[1], a.hidden, a.ahead
+
+    def p(*shape, scale):
+        return (torch.randn(*shape, device=dev) * scale).requires_grad_()
+    proj = p(NL, 4 * D, H, scale=(4 * D) ** -0.5)
+    up, gate = p(NL, 2 * H, 2 * H, scale=(2 * H) ** -0.5), p(NL, 2 * H, 2 * H, scale=(2 * H) ** -0.5)
+    down = p(NL, 2 * H, H, scale=0.0)
+    head = torch.zeros(NL, A, H, E, device=dev, requires_grad=True)
+    opt = torch.optim.Adam([proj, up, gate, down, head], lr=a.lr)
+    # (source L, lookahead k) pairs with a target inside the model
+    pairs = [(L, k) for k in range(1, A + 1) for L in range(NL - k)]
+    Ls = torch.tensor([L for L, _ in pairs], device=dev)
+    ks = torch.tensor([k for _, k in pairs], device=dev)
+    pred = torch.empty(len(pairs), T, E, device=dev)
+    zero = torch.zeros(D, device=dev)
+    t0 = time.time()
+    for t in range(T):
+        cur = rms(X[:, t].float())
+        prev = rms(X[:, t - 1].float()) if t else torch.zeros(NL, D, device=dev)
+        s = torch.zeros(H, device=dev)
+        states = []
+        for L in range(NL):
+            u = torch.cat([cur[L], cur[L - 1] if L else zero,
+                           prev[L + 1] if L + 1 < NL else zero, prev[L + 2] if L + 2 < NL else zero]) @ proj[L]
+            z = torch.cat([s, u])
+            s = s + (F.silu(z @ gate[L]) * (z @ up[L])) @ down[L]
+            states.append(s)
+        S = torch.stack(states)                                               # [NL, H]
+        base = torch.einsum("ped,pd->pe", W[Ls + ks], X[Ls, t].float())
+        out = base + torch.einsum("ph,phe->pe", S[Ls], head[Ls, ks - 1])
+        pred[:, t] = out.detach()
+        loss = (out - Y[Ls + ks, t]).square().mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    pi = torch.topk(pred, K, dim=-1).indices
+    hit = (pi.unsqueeze(-1) == real[Ls + ks].unsqueeze(-2)).any(-1).float().mean(-1).cpu().numpy()
+    for k in range(1, A + 1):
+        hm = np.full((NL, T), np.nan)
+        sel = (ks == k).cpu().numpy()
+        hm[k:] = hit[sel]
+        report(f"L+{k} stack h{H} lr {a.lr}", hm, d["bounds"], f"  ({time.time() - t0:.1f} s total)", d["gen"])
+
+
+if __name__ == "__main__":
+    main()
