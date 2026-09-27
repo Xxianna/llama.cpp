@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-pred.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -482,6 +483,7 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    llama_pred_free();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1402,7 +1404,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams) && llama_pred_graph_reusable()) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1423,6 +1425,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        llama_pred_graph_built();
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1718,6 +1721,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
         return -1;
     }
+
+    llama_pred_init(model);
+    llama_pred_step((int64_t) batch_inp.tokens.size());
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
@@ -2389,6 +2395,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
             res += lora->get_n_nodes();
         }
     }
+
+    // next-layer router predictors: ~30 nodes each for predict, train and score
+    llama_pred_init(model);
+    res += 40u * model.hparams.n_layer() * llama_pred_ahead();
 
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;

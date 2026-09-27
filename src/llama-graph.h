@@ -1025,6 +1025,15 @@ struct llm_graph_context {
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
+    // next-layer router predictor (llama-pred.h): predictions made at an earlier layer, by target layer
+    struct pred_pending {
+        ggml_tensor * w;    // predictor weights [n_embd, n_expert]
+        ggml_tensor * x;    // its input: the earlier layer's MoE input [n_embd, n_tokens]
+        ggml_tensor * pred; // predicted router logits [n_expert, n_tokens]
+        int           k;    // lookahead
+    };
+    mutable std::map<int, std::vector<pred_pending>> pred_todo;
+
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;

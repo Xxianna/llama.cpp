@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "llama-pred.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2040,6 +2041,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         logits = probs_in;
     }
 
+    // next-layer router predictor: from this layer's MoE input, predict the router logits of the
+    // next llama_pred_ahead() layers (trained and scored once those layers' routers ran)
+    const bool pred_on = llama_pred_ahead() > 0 && probs_in == nullptr && n_tokens <= llama_pred_max_batch();
+    ggml_tensor * logits_raw = logits;
+    if (pred_on) {
+        for (int k = 1; k <= llama_pred_ahead(); ++k) {
+            ggml_tensor * w = llama_pred_w(il, k);
+            if (!w) {
+                break;
+            }
+            ggml_tensor * p = ggml_mul_mat(ctx0, w, cur); // [n_expert, n_tokens]
+            cb(p, "pred_logits", il);
+            pred_todo[il + k].push_back({ w, cur, p, k });
+        }
+    }
+
     if (gate_inp_b) {
         logits = ggml_add(ctx0, logits, gate_inp_b);
         cb(logits, "ffn_moe_logits_biased", il);
@@ -2119,6 +2136,52 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+
+    // next-layer router predictor: train the predictions that targeted this layer (NLMS on the router
+    // logits) and count their top-k hits, on the device
+    if (pred_on && pred_todo.count(il) && (llama_pred_train_now() || llama_pred_score_now())) {
+        const bool plain = hparams.n_expert_groups <= 1 && arch != LLM_ARCH_LLAMA4 && arch != LLM_ARCH_GROVEMOE;
+        // one-hot [n_expert, n_tokens] of the top n_expert_used of v (ids: its sorted top-k)
+        auto onehot = [&](ggml_tensor * v, ggml_tensor * ids) {
+            ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, v, 1, n_expert, n_tokens), ids); // [1, k, n_tokens]
+            ggml_tensor * kth  = ggml_view_3d(ctx0, vals, 1, 1, n_tokens, vals->nb[1], vals->nb[2], (n_expert_used - 1)*vals->nb[1]);
+            kth = ggml_reshape_2d(ctx0, ggml_cont(ctx0, kth), 1, n_tokens);
+            return ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, v, kth), 1.0f, 1e-6f));
+        };
+        ggml_tensor * real = plain && llama_pred_score_now() ? onehot(selection_probs, selected_experts) : nullptr;
+        for (const auto & e : pred_todo[il]) {
+            if (e.pred->ne[1] != n_tokens) {
+                continue; // the last layer keeps only the output rows
+            }
+            // NLMS: w += mu/|x|^2 * x (x) (logits - pred)
+            if (llama_pred_train_now()) {
+                ggml_tensor * err = ggml_sub(ctx0, logits_raw, e.pred);
+                ggml_tensor * nrm = ggml_sum_rows(ctx0, ggml_sqr(ctx0, e.x));                 // [1, n_tokens]
+                ggml_tensor * g   = ggml_mul(ctx0, ggml_div(ctx0, err, nrm), llama_pred_mu());
+                ggml_tensor * dw  = ggml_out_prod(ctx0, e.x, g);                              // [n_embd, n_expert]
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_add(ctx0, e.w, dw), e.w));
+            }
+            if (!real) {
+                continue;
+            }
+            // score the prediction the way this layer selects (gating + selection bias)
+            ggml_tensor * ps = e.pred;
+            switch (gating_op) {
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:       ps = ggml_soft_max(ctx0, ps); break;
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:       ps = ggml_sigmoid(ctx0, ps); break;
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: ps = ggml_sqrt(ctx0, ggml_softplus(ctx0, ps)); break;
+                default: break;
+            }
+            if (exp_probs_b) {
+                ps = ggml_add(ctx0, ps, exp_probs_b);
+            }
+            ggml_tensor * pids = ggml_argsort_top_k(ctx0, ps, n_expert_used);
+            ggml_tensor * hits = ggml_sum(ctx0, ggml_mul(ctx0, onehot(ps, pids), real));
+            ggml_tensor * st   = ggml_view_1d(ctx0, llama_pred_stats(), 1, (e.k - 1)*sizeof(float));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_add(ctx0, st, hits), st));
+        }
+        pred_todo.erase(il);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
