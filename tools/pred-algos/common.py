@@ -1,0 +1,90 @@
+"""Shared harness for the MoE expert-predictor algorithm search.
+
+Data: a .pt stream built by pred_lab.py (X [NL,T,D] MoE inputs, Y [NL,T,E] router logits, W routers, bounds)
+plus the token ids of each sample, re-tokenized from its source text and cached next to the .pt.
+Every algorithm streams the tokens in order (one user session, online learning) and reports a hit matrix
+hits[l, t] = fraction of layer l's real top-k it predicted for token t (NaN where it made no prediction).
+"""
+import ast, glob, os, subprocess, sys, warnings
+warnings.filterwarnings("ignore", "Mean of empty slice")
+
+import numpy as np
+import torch
+
+MODEL = "/m/o/8/4/OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf"
+TOKENIZE = os.path.join(os.path.dirname(__file__), "..", "..", "build-cuda", "bin", "llama-tokenize")
+DATA = os.path.expandvars("$CLAUDE_JOB_DIR/tmp/olmo")
+SETS = {"simcity": ("simcity.pt", "S*.txt"), "session": ("session.pt", "L*.txt")}
+
+
+def tokenize(path):
+    out = subprocess.run([TOKENIZE, "-m", MODEL, "-f", path, "--ids", "--log-disable"],
+                         capture_output=True, text=True, check=True).stdout
+    return ast.literal_eval(out.strip())
+
+
+def load(name, need_x=False):
+    """-> dict(tokens [T] int64, real [NL,T,k] int64, bounds, and X/W when need_x)"""
+    pt, pattern = SETS[name]
+    d = torch.load(os.path.join(DATA, pt), mmap=True)
+    bounds, k = d["bounds"], d["k"]
+    cache = os.path.join(DATA, name + ".tokens.pt")
+    if os.path.exists(cache):
+        tokens = torch.load(cache)
+    else:
+        # match source texts to samples by token count (a sample whose dump failed was dropped)
+        lens = [bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)]
+        toks, gen, i = [], [], 0
+        for f in sorted(glob.glob(os.path.join(DATA, pattern))):
+            if i < len(lens) and len(t := tokenize(f)) == lens[i]:
+                # the prompt ends with the assistant tag: tokens after it were generated
+                text = open(f).read()
+                head = text[:text.index("<|assistant|>\n") + len("<|assistant|>\n")]
+                with open(os.path.join(DATA, "_head.txt"), "w") as h:
+                    h.write(head)
+                n_prompt = len(tokenize(os.path.join(DATA, "_head.txt")))
+                toks += t
+                gen += [False] * n_prompt + [True] * (len(t) - n_prompt)
+                i += 1
+        assert i == len(lens), f"only matched {i} of {len(lens)} samples"
+        tokens = {"ids": torch.tensor(toks), "gen": torch.tensor(gen)}
+        torch.save(tokens, cache)
+    out = {"tokens": tokens["ids"], "gen": tokens["gen"].numpy(), "real": torch.topk(d["Y"], k, dim=-1).indices, "bounds": bounds, "k": k,
+           "n_expert": d["Y"].shape[2]}
+    if need_x:
+        out["X"], out["W"], out["Y"] = d["X"], d["W"], d["Y"]
+    return out
+
+
+def report(name, hits, bounds, extra="", gen=None, cols=None):
+    """hits [NL, T] (NaN = no prediction). Prints avg over windows used to rank convergence.
+    With gen (bool [T]) a second report covers only the generated tokens (prompts often repeat earlier text)."""
+    if gen is not None:
+        report(name, hits, bounds, extra)
+        report(name + " [generated only]", np.where(gen[None, :], hits, np.nan), bounds, cols=gen)
+        return
+    h = np.asarray(hits, dtype=np.float64)
+    T = h.shape[1]
+    tok = np.nanmean(h, 0)                                  # per token over layers
+    def avg(a, b):
+        s = tok[a:min(b, T)]
+        return np.nanmean(s) if np.isfinite(s).any() else float("nan")
+    cov = np.isfinite(h[:, cols] if cols is not None else h).mean()  # over the reported tokens
+    print(f"{name}: all {avg(0, T):.3f}  0-256 {avg(0, 256):.3f}  0-1024 {avg(0, 1024):.3f}  "
+          f"last4k {avg(T - 4096, T):.3f}  coverage {cov:.3f}{extra}")
+    win = [avg(a, a + 1024) for a in range(0, T, 1024)]
+    print("  per 1024 tok: " + " ".join(f"{w:.2f}" for w in win))
+    lay = np.nanmean(h, 1)
+    print("  per layer:    " + " ".join(f"{v:.2f}" for v in lay))
+
+
+def overlap(pred, real):
+    """pred, real: [..., k] ids -> fraction of real found in pred"""
+    return (np.asarray(real)[..., :, None] == np.asarray(pred)[..., None, :]).any(-1).mean(-1)
+
+
+def cli(desc):
+    import argparse
+    ap = argparse.ArgumentParser(description=desc)
+    ap.add_argument("--data", default="simcity", choices=list(SETS))
+    return ap
