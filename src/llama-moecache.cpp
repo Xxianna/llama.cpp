@@ -180,6 +180,7 @@ struct layer_state {
     std::vector<int32_t>  pool_expert;
     std::vector<int32_t>  pool_slot;
     bool                  pool_dirty = false;
+    std::vector<uint8_t>  jitted; // expert id -> sits in a stream slot because the JIT put it there (promotion needs the swap margin)
 
     uint64_t n_hit  = 0;
     uint64_t pred_seen_hit = 0, pred_seen_miss = 0; // n_hit / n_miss at the last predictor on/off decision
@@ -2233,11 +2234,15 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             const char * ss = getenv("LLAMA_MOE_CACHE_STREAM_SLOTS");
             n_stream = p && atoi(p) > 0 ? std::max(0, ss ? atoi(ss) : 4) : 0;
         }
+        // LLAMA_MOE_CACHE_JIT_SLOTS=n (default 0, opt-in: no measurable gain on GLM): JIT scratch slots per layer on the fastest link (JIT uploads rotate
+        // through them instead of evicting cached experts; a used one is promoted like a streamed expert)
+        const int32_t jit_slots = [] { const char * e = getenv("LLAMA_MOE_CACHE_JIT_SLOTS"); return e ? std::max(0, atoi(e)) : 0; }();
         size_t vram = 0;
         for (auto & ls : mc->layers) {
             const int64_t n_expert = ls.pub.up_src->ne[2];
             const int32_t ns = ls.pub.n_slots;
-            ls.n_cache = ns > 2*n_stream ? ns - n_stream : ns;
+            const int32_t n_stream_l = std::max(n_stream, ls.link == 0 ? jit_slots : 0);
+            ls.n_cache = ns > 2*n_stream_l ? ns - n_stream_l : ns;
             ls.is_stream.assign(ns, 0);
             ls.stream_score.assign(ns, 0.0f);
             ls.stream_step.assign(ns, 0);
@@ -2269,6 +2274,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             ls.queued.assign(n_expert, 0);
             ls.prefetched.assign(n_expert, 0);
             ls.adopt_mask.assign(n_expert, 0);
+            ls.jitted.assign(n_expert, 0);
 
             std::vector<int32_t> dummy(n_expert, ns);
             if (g_neg_ids) {
@@ -2810,11 +2816,13 @@ void llama_moe_cache_jit(const llama_moe_cache_layer * pub, const ggml_tensor * 
     }
     for (int i = 0; i < kb; ++i) {
         const int32_t id = miss[i];
-        // slot: an empty one, else the lowest-scored cached expert this token doesn't use
+        // slot: with scratch (stream) slots, one of those (empty, else the lowest-scored expert this token doesn't use);
+        // otherwise (JIT=1 admitted / JIT=2 any) an empty cache slot, else the lowest-scored cached expert
+        const bool scratch = !ls.stream_slots.empty() && knobs().jit < 2;
         int32_t slot = -1;
         double best = 1e300;
         for (int32_t s = 0; s < ls.pub.n_slots; ++s) {
-            if (ls.slot_in_flight[s] || ls.is_stream[s]) {
+            if (ls.slot_in_flight[s] || (ls.is_stream[s] != 0) != scratch) {
                 continue;
             }
             const int32_t x = ls.slot_expert[s];
@@ -2832,7 +2840,7 @@ void llama_moe_cache_jit(const llama_moe_cache_layer * pub, const ggml_tensor * 
         if (victim >= 0) {
             // JIT=1: admitted only as the step's swap would be (no churn): hotter than the victim by the link's pay-back
             // margin; JIT=2: any miss may evict the lowest-scored expert this token doesn't use
-            if (knobs().jit < 2 && ((knobs().big != 0 && ls.glob_count[id] < ls.glob_count[victim]) ||
+            if (!scratch && knobs().jit < 2 && ((knobs().big != 0 && ls.glob_count[id] < ls.glob_count[victim]) ||
                     score(ls, id) < score(ls, victim) + mc->link_margin[ls.link])) {
                 continue;
             }
@@ -2849,9 +2857,14 @@ void llama_moe_cache_jit(const llama_moe_cache_layer * pub, const ggml_tensor * 
             const size_t sz = srcs[k]->nb[2];
             ggml_backend_tensor_set_async(be, dsts[k], (const char *) srcs[k]->data + (size_t) id*sz, (size_t) slot*dsts[k]->nb[2], sz);
         }
+        if (victim >= 0) {
+            ls.slot_expert[slot] = -1;
+            ls.jitted[victim] = 0;
+        }
         ls.slot_expert[slot]    = id;
         ls.expert_slot[id]      = slot;
         ls.slot_last_use[slot]  = ++mc->clock;
+        ls.jitted[id]           = scratch;
         set_table_entry(ls.pub, id, slot); // host table now: the CPU op skips it; device table flushed before the chain
         ls.cached_since[id] = mc->n_steps + 1;
         ls.up_t[id]    = ggml_time_us();
@@ -3435,7 +3448,7 @@ void llama_moe_cache_step() {
                 const double c = score(ls, v);
                 if (c < best) { best = c; s_vic = s; }
             }
-            if (s_vic < 0 || score(ls, id) <= best) {
+            if (s_vic < 0 || score(ls, id) <= best + (ls.jitted[id] && best >= 0 ? mc->link_margin[ls.link] : 0)) {
                 continue;
             }
             if (knobs().big != 0 && ls.slot_expert[s_vic] >= 0 && ls.glob_count[id] < ls.glob_count[ls.slot_expert[s_vic]]) {
@@ -3454,6 +3467,7 @@ void llama_moe_cache_step() {
             ls.is_stream[s_vic] = 1;
             std::replace(ls.stream_slots.begin(), ls.stream_slots.end(), s_str, s_vic);
             ls.prefetched[id] = 0;
+            ls.jitted[id] = 0;
             mc->n_promoted++;
         }
         ls.stream_hit.clear();
