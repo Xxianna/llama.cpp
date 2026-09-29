@@ -98,6 +98,51 @@ def sim_fork(seq, C, window=64, k=16.0, margin=2.0, max_ins=2):
             cache.remove(v); cache.add(e); ins += 1
     return hit, tot
 
+
+def sim_lruk(seq, C, K=2):
+    """LRU-K: evict the cached expert whose K-th most recent use is oldest (K=2 ignores one-off bursts)."""
+    hist = collections.defaultdict(lambda: collections.deque(maxlen=K)); cache = set(); hit = tot = 0
+    for t, ids in enumerate(seq):
+        for e in ids:
+            if t >= a.warm:
+                tot += 1
+                if e in cache: hit += 1
+        for e in ids: hist[e].append(t)
+        key = lambda x: (hist[x][0] if len(hist[x]) >= K else -1, hist[x][-1])
+        for e in ids:
+            if e in cache: continue
+            if len(cache) >= C:
+                v = min((x for x in cache if x not in ids), key=key, default=None)
+                if v is None: continue
+                cache.remove(v)
+            cache.add(e)
+    return hit, tot
+
+def sim_slru(seq, C, prot=0.5):
+    """segmented LRU: a hit promotes an expert into the protected segment (prot * C); the probationary segment evicts first."""
+    P = int(prot*C); probation = collections.OrderedDict(); protected = collections.OrderedDict(); hit = tot = 0
+    for t, ids in enumerate(seq):
+        for e in ids:
+            if t >= a.warm:
+                tot += 1
+                if e in probation or e in protected: hit += 1
+        for e in ids:
+            if e in protected: protected.move_to_end(e)
+            elif e in probation:
+                del probation[e]; protected[e] = 1
+                if len(protected) > P:
+                    old, _ = protected.popitem(last=False); probation[old] = 1
+            else:
+                if len(probation) + len(protected) >= C:
+                    victim = next((v for v in probation if v not in ids), None)
+                    if victim is None:
+                        victim = next((v for v in protected if v not in ids), None)
+                        if victim is None: continue
+                        del protected[victim]
+                    else: del probation[victim]
+                probation[e] = 1
+    return hit, tot
+
 def sim_hot(seq, C):
     cnt = collections.Counter(e for ids in seq for e in ids)
     cache = {e for e, _ in cnt.most_common(C)}
@@ -128,7 +173,7 @@ def sim_belady(seq, C):
 
 for f in [float(x) for x in a.frac.split(",")]:
     C = max(1, int(f*n_exp)); res = {}
-    for name, fn in [("lru", sim_lru), ("lru2", lambda s, c: sim_lru(s, c, 2)), ("lfu", lambda s, c: sim_lfu(s, c)), ("lfuw", lambda s, c: sim_lfu(s, c, 512)), ("fork", sim_fork), ("hot", sim_hot), ("belady", sim_belady)]:
+    for name, fn in [("lru", sim_lru), ("lru2", lambda s, c: sim_lru(s, c, 2)), ("lfu", lambda s, c: sim_lfu(s, c)), ("lfuw", lambda s, c: sim_lfu(s, c, 512)), ("fork", sim_fork), ("lruk", sim_lruk), ("slru", sim_slru), ("hot", sim_hot), ("belady", sim_belady)]:
         h = t = 0
         for il in layers:
             x, y = fn(per[il], C); h += x; t += y
