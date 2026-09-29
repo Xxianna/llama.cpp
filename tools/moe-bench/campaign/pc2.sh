@@ -7,7 +7,7 @@ M=$HOME/qwen36.gguf; cd $HOME/pp || exit 1
 git fetch -q neurall release rc-next 2>&1 | tail -1
 build() { # dir rev
   [ -d $1 ] || git worktree add -q --detach $1 $2 2>&1 | tail -1
-  ( cd $1 && git checkout -q $2 && cmake -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DLLAMA_CURL=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache > $D/cfg_$(basename $1).log 2>&1 && nice cmake --build build-cpu --target llama-bench test-quantize-fns -j12 > $D/build_$(basename $1).log 2>&1 ) && log "built $1 $2" || log "BUILD FAILED $1"
+  ( cd $1 && git checkout -q $2 && cmake -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DLLAMA_CURL=OFF "-DCMAKE_CXX_FLAGS=-include algorithm -include cstdint" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache > $D/cfg_$(basename $1).log 2>&1 && nice cmake --build build-cpu --target llama-bench test-quantize-fns -j12 > $D/build_$(basename $1).log 2>&1 ) && log "built $1 $2" || log "BUILD FAILED $1"
 }
 build $HOME/w-b11399 5c739a3; build $HOME/w-rc 59b14a88c
 bench() { # tag bindir threads env
