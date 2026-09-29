@@ -9,7 +9,10 @@ for f in ("results.tsv", "results_w10.tsv", "results_pc2.tsv"):
             x = l.rstrip("\n").split("\t")
             if len(x) >= 6 and x[0] == "RESULT": rows.append(x[1:6])
 d = collections.defaultdict(list)
+cnt = collections.Counter()
 for m, t, v, k, val in rows:
+    if m == 'pc2':  # llama-bench prints pp512 then tg128 for each run
+        k = 'pp512' if cnt[v] % 2 == 0 else 'tg128'; cnt[v] += 1
     try: d[(m, t, k, re.sub(r"#\d+$", "", v))].append(float(val))
     except ValueError: pass
 print("# Campaign report\n")
