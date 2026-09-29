@@ -18,14 +18,15 @@ ssh "$W10" "taskkill /F /IM llama-server.exe" > /dev/null 2>&1
 
 # generic server launcher on W10: %1 = bin dir, %2 = log name (generated here, copied over: no nested ssh quoting)
 BAT=$(mktemp)
-printf '@echo off\r\nset PATH=N:\\nv\\bin;N:\\nv\\bin\\x64;%%1;%%PATH%%\r\nset LLAMA_MOE_CACHE_PREDICT_FILE=0\r\n%%1\\llama-server.exe -m %s --host 127.0.0.1 --port 8080 %s > N:\\tmp\\w10reg_%%2.log 2>&1\r\n' "$MODEL" "$XARGS" > "$BAT"
+printf '@echo off\r\nset PATH=N:\\nv\\bin;N:\\nv\\bin\\x64;%%1;%%PATH%%\r\nset LLAMA_MOE_CACHE_PREDICT_FILE=0\r\n%%1\\llama-server.exe -m %s --host 127.0.0.1 --port 8080 %s %%3 %%4 %%5 %%6 %%7 %%8 > N:\\tmp\\w10reg_%%2.log 2>&1\r\n' "$MODEL" "$XARGS" > "$BAT"
 scp -q "$BAT" "$W10:N:/tmp/w10reg_srv.bat" || { echo "ABORT: cannot copy launcher to W10"; exit 2; }
 rm -f "$BAT"
 
 run_variant() { # tag dir round
   local tag=$1 dir=$2 round=$3 t0 ok=0 sp tp
   hb "round $round $tag: start"
-  ssh "$W10" "N:\\tmp\\w10reg_srv.bat $dir $tag" > /dev/null 2>&1 & sp=$!
+  local va ve; if [ "$tag" = new ]; then va=$ARGS_NEW; ve=$ENV_NEW; else va=$ARGS_OLD; ve=$ENV_OLD; fi
+  ssh "$W10" "${ve:+set $ve&& }N:\\tmp\\w10reg_srv.bat $dir $tag $va" > /dev/null 2>&1 & sp=$!
   ssh -N -L "$PORT":127.0.0.1:8080 "$W10" & tp=$!
   t0=$(date +%s)
   while [ $(( $(date +%s) - t0 )) -lt 300 ]; do curl -sf -m 2 "localhost:$PORT/health" > /dev/null && { ok=1; break; }; kill -0 $sp 2>/dev/null || break; sleep 2; done
