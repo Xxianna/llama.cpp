@@ -3396,6 +3396,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_DSV4_HC_PRE && ops.begin()[1] == GGML_OP_RMS_NORM && ops.begin()[2] == GGML_OP_MUL) {
+        const ggml_tensor * hc_pre   = cgraph->nodes[node_idx];
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx+1];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx+2];
+        const ggml_tensor * nw       = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+        return hc_pre->src[0]->type == GGML_TYPE_F32 && hc_pre->src[1]->type == GGML_TYPE_F32 &&
+            nw->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(nw) && nw->ne[0] == hc_pre->ne[0] && ggml_nelements(nw) == nw->ne[0] &&
+            ggml_is_contiguous_rows(mul) && mul->ne[0] == hc_pre->ne[0] && ggml_nrows(mul) == hc_pre->ne[1] &&
+            rms_norm->src[0] == hc_pre && hc_pre->ne[0] <= 8192;
+    }
+
     if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
@@ -4276,6 +4288,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_dsv4_hc_pre_norm(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {

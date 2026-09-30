@@ -194,6 +194,56 @@ static __global__ void dsv4_hc_post_f32(
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
 }
 
+// hc_pre + rms_norm + mul(weight) in one kernel: one block per token. The hc-weighted sum is kept in shared memory
+// while the sum of squares is reduced, then written once, normalized and scaled.
+template <bool gated>
+static __global__ void dsv4_hc_pre_norm_f32(
+        const float * x,
+        const float * weights,
+        const float * nw,
+        float * dst,
+        int64_t n_embd,
+        int64_t hc,
+        int64_t sx0, int64_t sx1, int64_t sx2,
+        int64_t sw0, int64_t sw1, int64_t sw2,
+        int64_t sd1,
+        float   scale,
+        float   eps) {
+    extern __shared__ float row[];
+    __shared__ float red[32];
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t it = blockIdx.x;
+
+    float ss = 0.0f;
+    for (int64_t i0 = threadIdx.x; i0 < n_embd; i0 += blockDim.x) {
+        float sum = 0.0f;
+        for (int64_t ih = 0; ih < hc; ++ih) {
+            const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
+            float wv;
+            if constexpr (gated) {
+                wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+            } else {
+                wv = weights[ih*sw0 + it*sw1];
+            }
+            sum += xv * wv;
+        }
+        sum = scale * sum;
+        row[i0] = sum;
+        ss += sum * sum;
+    }
+    ss = warp_reduce_sum(ss);
+    const int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
+    if (lane == 0) { red[wid] = ss; }
+    __syncthreads();
+    ss = lane < (int) (blockDim.x / 32) ? red[lane] : 0.0f;
+    ss = warp_reduce_sum(ss);
+    const float inv = rsqrtf(ss / (float) n_embd + eps);
+    for (int64_t i0 = threadIdx.x; i0 < n_embd; i0 += blockDim.x) {
+        dst[i0 + it*sd1] = row[i0] * inv * nw[i0];
+    }
+}
+
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * mixes = dst->src[0];
     const ggml_tensor * scale = dst->src[1];
@@ -313,4 +363,35 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+}
+
+void ggml_cuda_op_dsv4_hc_pre_norm(ggml_backend_cuda_context & ctx, ggml_tensor * hc_pre, const ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * x       = hc_pre->src[0];
+    const ggml_tensor * weights = hc_pre->src[1];
+    const ggml_tensor * nw      = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    GGML_TENSOR_LOCALS(size_t, nbx, x,       nb);
+    GGML_TENSOR_LOCALS(size_t, nbw, weights, nb);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+
+    const float scale = ggml_get_op_params_f32(hc_pre, 0);
+    const bool  gated = ggml_get_op_params_i32(hc_pre, 1) != 0;
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const int block_size = n_embd >= 1024 ? 512 : 256;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            dim3(n_tokens, 1, 1), dim3(block_size, 1, 1), n_embd * sizeof(float), ctx.stream());
+
+    auto kernel = gated ? dsv4_hc_pre_norm_f32<true> : dsv4_hc_pre_norm_f32<false>;
+    ggml_cuda_kernel_launch(kernel, launch_params,
+            (const float *) x->data, (const float *) weights->data, (const float *) nw->data, (float *) mul->data,
+            n_embd, hc,
+            nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
+            nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+            mul->nb[1] / sizeof(float),
+            scale, eps);
 }

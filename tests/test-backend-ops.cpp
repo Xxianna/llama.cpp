@@ -4338,6 +4338,47 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+// hc_pre followed by rms_norm * weight: the CUDA backend fuses the three into one kernel
+struct test_dsv4_hc_pre_norm : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    gated;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, gated);
+    }
+
+    test_dsv4_hc_pre_norm(int64_t n_embd = 31, int64_t n_tokens = 17, bool gated = false)
+        : n_embd(n_embd), n_tokens(n_tokens), gated(gated) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_hc = 4;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * pre;
+        if (gated) {
+            ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+            ggml_set_name(gate, "gate");
+            pre = ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f/n_hc);
+        } else {
+            ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_tokens);
+            ggml_set_name(weights, "weights");
+            pre = ggml_dsv4_hc_pre(ctx, x, weights);
+        }
+        ggml_tensor * nw = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(nw, "nw");
+        out = ggml_mul(ctx, ggml_rms_norm(ctx, pre, 1e-6f), nw);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -9171,6 +9212,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 4, 257));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
+    for (int64_t ne : { 31, 2048, 4096 }) {
+        for (int64_t nt : { 1, 5 }) {
+            test_cases.emplace_back(new test_dsv4_hc_pre_norm(ne, nt, false));
+            test_cases.emplace_back(new test_dsv4_hc_pre_norm(ne, nt, true));
+        }
+    }
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
