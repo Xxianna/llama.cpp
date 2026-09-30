@@ -3397,6 +3397,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     }
 
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_DSV4_HC_PRE && ops.begin()[1] == GGML_OP_RMS_NORM && ops.begin()[2] == GGML_OP_MUL) {
+        static const bool disabled = getenv("GGML_CUDA_DISABLE_HC_NORM_FUSION") != nullptr; // A/B switch
+        if (disabled) {
+            return false;
+        }
         const ggml_tensor * hc_pre   = cgraph->nodes[node_idx];
         const ggml_tensor * rms_norm = cgraph->nodes[node_idx+1];
         const ggml_tensor * mul      = cgraph->nodes[node_idx+2];
