@@ -216,6 +216,10 @@ struct llama_model_loader {
 
     bool get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required = true);
 
+    // resolve a llm_kv id to the key name actually present in metadata;
+    // unsloth-family GLM-5.3-Flash GGUFs prefix keys with "glm5next." instead of "glm5-next."
+    std::string kv_key(enum llm_kv kid);
+
     std::string get_arch_name() const;
 
     enum llm_arch get_arch() const;

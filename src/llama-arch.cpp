@@ -1062,6 +1062,11 @@ const char * llm_arch_name(llm_arch arch) {
 }
 
 llm_arch llm_arch_from_string(const std::string & name) {
+    // unsloth-family GLM-5.3-Flash GGUFs use "glm5next" (no hyphen) as the arch string
+    if (name == "glm5next") {
+        return LLM_ARCH_GLM5_NEXT;
+    }
+
     for (const auto & kv : LLM_ARCH_NAMES) { // NOLINT
         if (kv.second == name) {
             return kv.first;
