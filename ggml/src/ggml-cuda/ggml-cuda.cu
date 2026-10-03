@@ -1898,17 +1898,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        if (getenv("GGML_MMVQ_DEBUG")) {
-            fprintf(stderr, "mmvq-mm: src0 '%s' [%lld,%lld,%lld,%lld] type=%d src1 '%s' [%lld,%lld,%lld,%lld] ne11=%lld\n",
-                    src0->name, (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3], (int)src0->type,
-                    src1->name, (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], (long long)src1->ne[3],
-                    (long long)ne11);
-        }
+    // MMVQ maps samples to gridDim.z (CUDA limit 65535): batched inputs like
+    // [kv_lora, 1, n_head, tile] with n_head*tile > 65535 would abort with
+    // "invalid argument" — fall through to cuBLAS instead.
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && src1->ne[2]*src1->ne[3] <= 65535) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0) && src1->ne[2]*src1->ne[3] <= 65535) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
