@@ -847,6 +847,51 @@ static bool ggml_gallocr_reserve_n_impl(
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
+    // GGML_ALLOC_DUMP=1: largest planned tensors of this graph (nodes + their parents).
+    // Used to diagnose compute-buffer blowups (lifetime reuse failures show up as peak == sum).
+    if (getenv("GGML_ALLOC_DUMP") != NULL) {
+        struct dump_item { const char * name; size_t size; int buffer_id; };
+        size_t cap = (size_t) graph->n_nodes * (GGML_MAX_SRC + 1);
+        struct dump_item * items = calloc(cap, sizeof(struct dump_item));
+        size_t n_items = 0;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * cand[GGML_MAX_SRC + 1];
+            cand[0] = graph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; j++) { cand[j+1] = graph->nodes[i]->src[j]; }
+            for (int j = 0; j <= GGML_MAX_SRC; j++) {
+                struct ggml_tensor * t = cand[j];
+                if (t == NULL || t->view_src || t->data) continue;
+                struct hash_node * hn = ggml_gallocr_hash_get(galloc, t);
+                if (hn->buffer_id < 0) continue;
+                size_t sz = ggml_nbytes(t);
+                if (sz < (1u << 20) || n_items >= cap) continue;
+                items[n_items].name = t->name[0] ? t->name : "(unnamed)";
+                items[n_items].size = sz;
+                items[n_items].buffer_id = hn->buffer_id;
+                n_items++;
+            }
+        }
+        // simple insertion sort desc by size
+        for (size_t i = 1; i < n_items; i++) {
+            struct dump_item key = items[i];
+            size_t j = i;
+            while (j > 0 && items[j-1].size < key.size) { items[j] = items[j-1]; j--; }
+            items[j] = key;
+        }
+        fprintf(stderr, "alloc-dump: graph %d nodes, %zu allocations >=1MiB, top 60 (dedup by name+size+buf):\n", graph->n_nodes, n_items);
+        size_t shown = 0;
+        for (size_t i = 0; i < n_items && shown < 60; i++) {
+            bool dup = false;
+            for (size_t j = 0; j < i; j++) {
+                if (items[j].name == items[i].name && items[j].size == items[i].size && items[j].buffer_id == items[i].buffer_id) { dup = true; break; }
+            }
+            if (dup) continue;
+            fprintf(stderr, "  [%7.1f MiB buf%d] %s\n", items[i].size / 1048576.0, items[i].buffer_id, items[i].name);
+            shown++;
+        }
+        free(items);
+    }
+
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
         free(galloc->node_allocs);
