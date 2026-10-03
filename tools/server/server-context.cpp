@@ -3819,12 +3819,37 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // spec-timer: target decode (both plain decode and spec verify batches)
+        static double tgt_acc_ms = 0.0;
+        static int    tgt_cnt    = 0;
+        static int    tgt_tok    = 0;
+        const auto tgt_t0 = std::chrono::steady_clock::now();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        {
+            const double d = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tgt_t0).count();
+            const int nbs = (int) batch.view.size();
+            tgt_acc_ms += d;
+            tgt_cnt    += 1;
+            tgt_tok    += nbs;
+            static double acc_by_size[8] = {0};
+            static int    cnt_by_size[8] = {0};
+            const int bucket = nbs < 8 ? nbs : 7;
+            acc_by_size[bucket] += d;
+            cnt_by_size[bucket] += 1;
+            if (tgt_cnt % 128 == 0) {
+                fprintf(stderr, "spec-timer: target decode avg %.2f ms/call (avg batch %.1f tok) over %d calls | per-size:",
+                        tgt_acc_ms / tgt_cnt, (double) tgt_tok / tgt_cnt, tgt_cnt);
+                for (int b = 1; b < 8; ++b) {
+                    if (cnt_by_size[b] > 0) fprintf(stderr, " [%d]=%.1fms x%d", b, acc_by_size[b] / cnt_by_size[b], cnt_by_size[b]);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
 
         if (ret != 0) {
             {

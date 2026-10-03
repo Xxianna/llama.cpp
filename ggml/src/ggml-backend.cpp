@@ -1,5 +1,7 @@
 // Note: porting this file to C++ is a work in progress
 
+#include <chrono>
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -1915,6 +1917,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     double dbg_sub[GGML_SCHED_MAX_BACKENDS] = {}, dbg_full[GGML_SCHED_MAX_BACKENDS] = {};
     int64_t dbg_sync_in = 0, dbg_sync_ids = 0, dbg_sync_full = 0;
     GGML_ASSERT(sched);
+    const auto ts_t0 = std::chrono::steady_clock::now();
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -2631,9 +2634,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                        " MB, whole tensors " + std::to_string((int) (dbg_full[b] / 1e6)) + " MB;";
             }
         }
-        if (!per.empty()) {
+        if (!per.empty() || true) { // stage-timer: always print when MMID_DEBUG is on (sync breakdown is useful without expert copies too)
             GGML_LOG_WARN("sched: host weights copied%s host sync ms: before inputs %.0f, ids %.0f, whole-tensor copies %.0f\n",
                 per.c_str(), dbg_sync_in / 1e3, dbg_sync_ids / 1e3, dbg_sync_full / 1e3);
+        }
+    }
+    // stage-timer: whole compute_splits call (cpu + cuda + boundary sync), to diff against the per-backend numbers
+    {
+        static double ts_acc = 0.0;
+        static int    ts_cnt = 0;
+        const double d = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts_t0).count();
+        ts_acc += d; ts_cnt += 1;
+        if (ts_cnt % 128 == 0) {
+            fprintf(stderr, "stage-timer: sched compute_splits avg %.3f ms x%d\n", ts_acc / ts_cnt, ts_cnt);
         }
     }
     return GGML_STATUS_SUCCESS;

@@ -13,6 +13,8 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1544,6 +1546,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const common_batch & batch_in) override {
+        // spec-timer: measure the whole draft process() call (llama_process loop + sampling + h handover)
+        static double spec_acc_ms = 0.0;
+        static int    spec_cnt    = 0;
+        struct SpecTimer {
+            std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            ~SpecTimer() {
+                const double d = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                spec_acc_ms += d;
+                spec_cnt    += 1;
+                if (spec_cnt % 64 == 0) {
+                    fprintf(stderr, "spec-timer: draft_mtp::process avg %.2f ms/call over %d calls\n", spec_acc_ms / spec_cnt, spec_cnt);
+                }
+            }
+        } spec_timer_guard;
+
         if (batch_in.size() <= 0) {
             return true;
         }

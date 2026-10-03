@@ -7,6 +7,7 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -187,7 +188,21 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
 
-    return ggml_graph_compute(cgraph, &cplan);
+    // stage-timer: net CPU graph_compute time and node counts (dispatch vs compute split)
+    {
+        static double tc_acc = 0.0;
+        static int    tc_cnt = 0;
+        static int64_t tc_nodes = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto st = ggml_graph_compute(cgraph, &cplan);
+        const double d = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        tc_acc += d; tc_cnt += 1; tc_nodes += cgraph->n_nodes;
+        if (tc_cnt % 512 == 0) {
+            fprintf(stderr, "stage-timer: cpu graph_compute avg %.3f ms x%d (avg %.1f nodes/graph)\n",
+                    tc_acc / tc_cnt, tc_cnt, (double) tc_nodes / tc_cnt);
+        }
+        return st;
+    }
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {

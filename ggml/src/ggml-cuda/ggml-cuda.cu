@@ -1,4 +1,5 @@
 #if defined(__linux__)
+#include <chrono>
 #include <sys/mman.h>
 #endif
 #include "ggml-cuda.h"
@@ -4573,6 +4574,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // stage-timer: net CUDA-side graph_compute (incl. launch + sync inside)
+    static double tg_acc = 0.0;
+    static int    tg_cnt = 0;
+    const auto tg_t0 = std::chrono::steady_clock::now();
+    struct TgTimer {
+        std::chrono::steady_clock::time_point t0;
+        ~TgTimer() {
+            const double d = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            tg_acc += d; tg_cnt += 1;
+            if (tg_cnt % 512 == 0) {
+                fprintf(stderr, "stage-timer: cuda graph_compute avg %.3f ms x%d\n", tg_acc / tg_cnt, tg_cnt);
+            }
+        }
+    } tg_guard{tg_t0};
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
