@@ -403,7 +403,14 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         const bool mtp_share = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mctx_hyb->get_mtp_dsa_index_share();
 
         inp->n_sel = (uint32_t) n_sel;
-        inp->gather = (int64_t) n_tokens <= max_ub && (int64_t) n_kv > n_sel;
+        // GGML_DSA_GATHER_PREFILL=1: use the (now tiled) gather path for big prefill batches too —
+        // the scatter path materializes an [n_kv x n_tokens] f16 mask and runs full O(n_kv*n_tokens)
+        // flash attention over it, which is prohibitive at long contexts.
+        static const bool gather_prefill = [] {
+            const char * e = getenv("GGML_DSA_GATHER_PREFILL");
+            return e && atoi(e) != 0;
+        }();
+        inp->gather = ((int64_t) n_tokens <= max_ub || gather_prefill) && (int64_t) n_kv > n_sel;
         inp->mtp_share = mtp_share;
 
         // Both paths read the slot mask: gather adds it to the scores, scatter maps its dead slots to dump rows.
@@ -1178,30 +1185,56 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     ggml_tensor * out = nullptr;
     if (inp_kpool->gather) {
         // Attend over gathered latents with the token dimension in ne[3].
-
-        ggml_build_forward_expand(gf, kq_mask);
+        // The gathered latents are 4+ MB per token, so the token dimension is processed in
+        // tiles: peak scratch is n_sel*tile instead of n_sel*n_tokens (env GGML_DSA_GATHER_TILE).
+        // Note: the [n_kv x n_tokens] kq_mask is NOT expanded here — only the scatter path reads it.
 
         ggml_tensor * sel_idx = sel; // I32 [n_sel, n_tokens]
         const int64_t n_sel = sel_idx->ne[0];
 
-        ggml_tensor * k_g = mctx_hyb->gather_mla_rows(ctx0, sel_idx, n_sel*n_tokens, kv_lora_rank, il);
-        k_g = ggml_reshape_4d(ctx0, k_g, kv_lora_rank, n_sel, 1, n_tokens); // F32 [kv_lora_rank, n_sel, 1, n_tokens]
-        cb(k_g, "kv_gathered", il);
+        static const int64_t gather_tile = [] {
+            const char * e = getenv("GGML_DSA_GATHER_TILE");
+            return e ? atoll(e) : 4096;
+        }();
 
-        ggml_tensor * q_g = ggml_permute(ctx0, q_absorbed, 0, 2, 3, 1); // [kv_lora_rank, 1, n_head, n_tokens]
+        std::vector<ggml_tensor *> out_tiles;
+        for (int64_t tb = 0; tb < n_tokens; tb += gather_tile) {
+            const int64_t tn = std::min<int64_t>(gather_tile, n_tokens - tb);
 
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k_g, q_g);                // [n_sel, 1, n_head, n_tokens]
-        ggml_prec_set_acc(kq, GGML_PREC_F32);
-        kq = ggml_soft_max_ext(ctx0, kq, inp_kpool->gather_mask, kq_scale, 0.0f);
-        cb(kq, "kq_soft_max_gathered", il);
+            auto sel_t  = ggml_view_2d(ctx0, sel_idx, n_sel, tn, sel_idx->nb[1], tb * sel_idx->nb[1]);
+            // q_absorbed is [kv_lora, n_head, n_tokens, 1]; take the token tile on ne[2] and
+            // put it on ne[3] so mul_mat broadcasts heads against the gathered rows for any tile size.
+            auto q_t    = ggml_permute(ctx0,
+                    ggml_view_4d(ctx0, q_absorbed, q_absorbed->ne[0], q_absorbed->ne[1], tn, 1,
+                        q_absorbed->nb[1], q_absorbed->nb[2], q_absorbed->nb[3], tb * q_absorbed->nb[2]),
+                    0, 2, 3, 1); // [kv_lora, 1, n_head, tn]
+            auto gm_t   = ggml_view_4d(ctx0, inp_kpool->gather_mask,
+                    inp_kpool->gather_mask->ne[0], inp_kpool->gather_mask->ne[1], inp_kpool->gather_mask->ne[2], tn,
+                    inp_kpool->gather_mask->nb[1], inp_kpool->gather_mask->nb[2], inp_kpool->gather_mask->nb[3],
+                    tb * inp_kpool->gather_mask->nb[3]);
 
-        ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, k_g)); // [n_sel, kv_lora_rank, 1, n_tokens]
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_t, kq);                // [kv_lora_rank, 1, n_head, n_tokens]
-        kqv = ggml_mul_mat(ctx0, layer.wv_b, kqv);                      // [n_embd_head_v, 1, n_head, n_tokens]
-        cb(kqv, "kqv_gathered", il);
+            ggml_tensor * k_g = mctx_hyb->gather_mla_rows(ctx0, sel_t, n_sel*tn, kv_lora_rank, il);
+            k_g = ggml_reshape_4d(ctx0, k_g, kv_lora_rank, n_sel, 1, tn); // F32 [kv_lora_rank, n_sel, 1, tn]
+            cb(k_g, "kv_gathered", il);
 
-        out = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));     // [n_embd_head_v, n_head, 1, n_tokens]
-        out = ggml_reshape_2d(ctx0, out, kqv->ne[0]*n_head, n_tokens);
+            ggml_tensor * kq = ggml_mul_mat(ctx0, k_g, q_t);               // [n_sel, 1, n_head, tn]
+            ggml_prec_set_acc(kq, GGML_PREC_F32);
+            kq = ggml_soft_max_ext(ctx0, kq, gm_t, kq_scale, 0.0f);
+            cb(kq, "kq_soft_max_gathered", il);
+
+            ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, k_g)); // [n_sel, kv_lora_rank, 1, tn]
+            ggml_tensor * kqv = ggml_mul_mat(ctx0, v_t, kq);                // [kv_lora_rank, n_head, 1, tn]
+            kqv = ggml_mul_mat(ctx0, layer.wv_b, kqv);                      // [n_embd_head_v, n_head, 1, tn]
+            cb(kqv, "kqv_gathered", il);
+
+            ggml_tensor * out_t = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3)); // [n_embd_head_v, 1, n_head, tn]
+            out_tiles.push_back(ggml_reshape_2d(ctx0, out_t, kqv->ne[0]*n_head, tn));
+        }
+
+        out = out_tiles[0];
+        for (size_t i = 1; i < out_tiles.size(); ++i) {
+            out = ggml_concat(ctx0, out, out_tiles[i], 1);
+        }
     } else {
         // The scatter selection already includes the causal mask.
         ggml_tensor * mask = ggml_reshape_4d(ctx0, sel, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);

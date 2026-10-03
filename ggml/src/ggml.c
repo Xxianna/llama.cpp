@@ -4210,6 +4210,11 @@ static struct ggml_tensor * ggml_soft_max_impl(
     GGML_ASSERT(ggml_is_contiguous(a));
 
     if (mask) {
+        if (mask->ne[0] != a->ne[0] || mask->ne[1] < a->ne[1] || a->ne[2] % mask->ne[2] != 0 || a->ne[3] % mask->ne[3] != 0) {
+            fprintf(stderr, "soft_max shape mismatch: a '%s' [%lld,%lld,%lld,%lld] vs mask '%s' [%lld,%lld,%lld,%lld]\n",
+                    a->name, (long long)a->ne[0], (long long)a->ne[1], (long long)a->ne[2], (long long)a->ne[3],
+                    mask->name, (long long)mask->ne[0], (long long)mask->ne[1], (long long)mask->ne[2], (long long)mask->ne[3]);
+        }
         GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(mask));
         GGML_ASSERT(mask->ne[0] == a->ne[0]);
