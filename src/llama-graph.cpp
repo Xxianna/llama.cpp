@@ -2838,10 +2838,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // Tiling keeps only [*, n_expert_used, tile] slices alive (LLAMA_MOE_TILE_TOKENS).
         static const int64_t moe_tile = [] {
             const char * e = getenv("LLAMA_MOE_TILE_TOKENS");
-            // default off: on CUDA the tiled chain corrupts output for n_tokens > tile
-            // (CPU is bit-correct; suspected async-copy race across the per-tile splits —
-            // see STREAMING_TODO.md §MoE tiling). Opt in explicitly.
-            return e ? atoll(e) : 0;
+            return e ? atoll(e) : 4096;
         }();
         const uint32_t n_used_il = hparams.n_expert_used(il);
         const bool can_tile = moe_tile > 0 && n_tokens > moe_tile &&
@@ -2849,6 +2846,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             !up_exps_s && !gate_exps_s && !down_exps_s && !weight_before_ffn;
         if (can_tile) {
             std::vector<ggml_tensor *> tile_outs;
+
             // the predictor (src[4]) and the full-selection handoff (src[5], set below via
             // moe_tile_downs) are full-width per-token tables; a tile's gate op indexes them
             // with tile-local token ids and would read the WRONG tokens' rows, making the

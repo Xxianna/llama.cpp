@@ -875,6 +875,8 @@ struct ggml_backend_sched {
     ggml_backend_event_t  prefetch_ready[GGML_SCHED_MAX_PREFETCH_SLOTS];
     ggml_backend_event_t  prefetch_free [GGML_SCHED_MAX_PREFETCH_SLOTS];
     bool prefetch_used[GGML_SCHED_MAX_PREFETCH_SLOTS];
+    std::vector<ggml_tensor *> weights_full_copied; // multi-consumer mm_id weights already fully copied this graph
+    std::vector<std::pair<ggml_tensor *, int>> mmid_n_consumers; // graph-wide MUL_MAT_ID consumers per weights copy
     int prefetch_cur;
 
     char * context_buffer;
@@ -1924,6 +1926,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // graph-wide MUL_MAT_ID consumer count per weights copy: token-tiled expert chains
+    // share one input_cpy across several consumers (possibly across splits), and the
+    // used-experts copy below must not run per consumer on the shared buffer
+    for (int i = 0; i < sched->graph.n_nodes; ++i) {
+        struct ggml_tensor * n = sched->graph.nodes[i];
+        if (n->op == GGML_OP_MUL_MAT_ID && n->src[0]) {
+            bool found = false;
+            for (auto & kv : sched->mmid_n_consumers) {
+                if (kv.first == n->src[0]) { kv.second++; found = true; break; }
+            }
+            if (!found) {
+                sched->mmid_n_consumers.push_back({n->src[0], 1});
+            }
+        }
+    }
+
     int prev_backend_id = -1;
     std::vector<ggml_backend_t> d2h_pending; // GGML_SCHED_D2H_ASYNC: GPU backends with async input fetches to wait for
 
@@ -2224,6 +2242,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
+
+                // token-tiled expert chains (LLAMA_MOE_TILE_TOKENS) put several MUL_MAT_ID
+                // consumers of the SAME weights copy into one graph — possibly in different
+                // splits. The used-experts copy below is driven by one split-head ids tensor
+                // per split; several consumers leave holes in the shared input copy that
+                // later tiles read as uninitialized weights. In that case copy the whole
+                // tensor once per graph (at large batches virtually every expert is used
+                // anyway) and mark it done. The consumer count is graph-wide.
+                bool mmid_multi = false;
+                if (split->graph.n_nodes > 0 &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer) &&
+                    node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy) {
+                    for (auto & kv : sched->mmid_n_consumers) {
+                        if (kv.first == input_cpy && kv.second > 1) { mmid_multi = true; break; }
+                    }
+                }
+                if (mmid_multi) {
+                    bool already = false;
+                    for (auto * t : sched->weights_full_copied) {
+                        if (t == input_cpy) { already = true; break; }
+                    }
+                    if (!already) {
+                        ggml_backend_synchronize(input_backend);
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        sched->weights_full_copied.push_back(input_cpy);
+                    }
+                    continue;
+                }
+
                 if (split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
@@ -2797,6 +2845,8 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
         sched->is_reset = true;
+    sched->weights_full_copied.clear();
+    sched->mmid_n_consumers.clear();
     }
     sched->is_alloc = false;
 }
