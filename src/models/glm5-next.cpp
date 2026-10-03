@@ -1187,10 +1187,19 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         // Attend over gathered latents with the token dimension in ne[3].
         // The gathered latents are 4+ MB per token, so the token dimension is processed in
         // tiles: peak scratch is n_sel*tile instead of n_sel*n_tokens (env GGML_DSA_GATHER_TILE).
-        // The [n_kv x n_tokens] kq_mask lives on the host and is filled by set_input even in
-        // gather mode (its buffer must be allocated or set_input aborts); only scatter reads it.
-
-        ggml_build_forward_expand(gf, kq_mask);
+        //
+        // The scatter path's [n_kv x n_tokens] kq_mask is NOT needed here. Expanding the real
+        // mask makes the scheduler copy it to GPU for every split (128GB at ctx=1M). Instead,
+        // replace the attention input's mask with a 1-element dummy: set_input writes to it
+        // harmlessly, gallocr allocates its tiny buffer, and no GPU copies happen.
+        {
+            ggml_tensor * mask_dummy = ggml_new_tensor_1d(ctx0, kq_mask->type, 1);
+            ggml_set_input(mask_dummy);
+            ggml_set_name(mask_dummy, "kq_mask_gather_dummy");
+            ggml_build_forward_expand(gf, mask_dummy);
+            inp_attn->self_kq_mask     = mask_dummy;
+            inp_attn->self_kq_mask_cnv = mask_dummy;
+        }
 
         ggml_tensor * sel_idx = sel; // I32 [n_sel, n_tokens]
         const int64_t n_sel = sel_idx->ne[0];

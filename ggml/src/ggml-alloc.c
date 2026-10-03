@@ -850,7 +850,7 @@ static bool ggml_gallocr_reserve_n_impl(
     // GGML_ALLOC_DUMP=1: largest planned tensors of this graph (nodes + their parents).
     // Used to diagnose compute-buffer blowups (lifetime reuse failures show up as peak == sum).
     if (getenv("GGML_ALLOC_DUMP") != NULL) {
-        struct dump_item { const char * name; size_t size; int buffer_id; };
+        struct dump_item { const char * name; size_t size; int buffer_id; int64_t ne0, ne1, ne2, ne3; };
         size_t cap = (size_t) graph->n_nodes * (GGML_MAX_SRC + 1);
         struct dump_item * items = calloc(cap, sizeof(struct dump_item));
         size_t n_items = 0;
@@ -868,6 +868,10 @@ static bool ggml_gallocr_reserve_n_impl(
                 items[n_items].name = t->name[0] ? t->name : "(unnamed)";
                 items[n_items].size = sz;
                 items[n_items].buffer_id = hn->buffer_id;
+                items[n_items].ne0 = t->ne[0];
+                items[n_items].ne1 = t->ne[1];
+                items[n_items].ne2 = t->ne[2];
+                items[n_items].ne3 = t->ne[3];
                 n_items++;
             }
         }
@@ -883,10 +887,10 @@ static bool ggml_gallocr_reserve_n_impl(
         for (size_t i = 0; i < n_items && shown < 60; i++) {
             bool dup = false;
             for (size_t j = 0; j < i; j++) {
-                if (items[j].name == items[i].name && items[j].size == items[i].size && items[j].buffer_id == items[i].buffer_id) { dup = true; break; }
+                if (items[j].name == items[i].name && items[j].size == items[i].size && items[j].buffer_id == items[i].buffer_id && items[j].ne0 == items[i].ne0 && items[j].ne1 == items[i].ne1) { dup = true; break; }
             }
             if (dup) continue;
-            fprintf(stderr, "  [%7.1f MiB buf%d] %s\n", items[i].size / 1048576.0, items[i].buffer_id, items[i].name);
+            fprintf(stderr, "  [%7.1f MiB buf%d] %s [%lldx%lldx%lldx%lld]\n", items[i].size / 1048576.0, items[i].buffer_id, items[i].name, (long long)items[i].ne0, (long long)items[i].ne1, (long long)items[i].ne2, (long long)items[i].ne3);
             shown++;
         }
         free(items);

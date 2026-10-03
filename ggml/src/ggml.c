@@ -8057,6 +8057,19 @@ void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph
 void ggml_set_input(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor->op == GGML_OP_NONE);
     tensor->flags |= GGML_TENSOR_FLAG_INPUT;
+    // trace any input tensor >1GB
+    if (getenv("GGML_INPUT_TRACE") && ggml_nbytes(tensor) > (1ULL<<30)) {
+        fprintf(stderr, "input-trace: '%s' [%lldx%lldx%lldx%lld] = %.1f GB\n",
+                tensor->name[0] ? tensor->name : "(unnamed)",
+                (long long)tensor->ne[0], (long long)tensor->ne[1], (long long)tensor->ne[2], (long long)tensor->ne[3],
+                (double)ggml_nbytes(tensor)/1e9);
+        // print a short backtrace to find the creator
+        void *bt[8];
+        int n = backtrace(bt, 8);
+        char **syms = backtrace_symbols(bt, n);
+        for (int i = 1; i < n && i < 5; i++) fprintf(stderr, "  bt[%d] %s\n", i, syms[i]);
+        free(syms);
+    }
 }
 
 void ggml_set_output(struct ggml_tensor * tensor) {

@@ -45,6 +45,32 @@ static ggml_tensor * build_attn_inp_kq_mask(
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
+    // trace any input tensor that would be >1GB
+    if ((int64_t) n_kv * n_tokens * ggml_type_size(type) / ggml_blck_size(type) > (1LL<<30)) {
+        fprintf(stderr, "mask-trace: LARGE mask [n_kv=%d x n_tokens=%d] in build_attn_inp_kq_mask\n", (int)n_kv, (int)n_tokens);
+    }
+
+    // The DSA gather path never reads this mask (only scatter does), but the input builder
+    // creates it unconditionally. At ctx=1M the [n_kv x n_tokens] mask is 128GB host +
+    // GPU copies per split. When gather prefill is requested, create a 1-element dummy
+    // instead: set_input fills it harmlessly, no memory is wasted.
+    static const bool dsa_gather_prefill = [] {
+        const char * e = getenv("GGML_DSA_GATHER_PREFILL");
+        return e && atoi(e) != 0;
+    }();
+    if (dsa_gather_prefill && (int64_t) n_tokens > 16) {
+        ggml_tensor * res = ggml_new_tensor_1d(ctx, type, 1);
+        ggml_set_input(res);
+        ggml_set_name(res, "attn_inp_kq_mask");
+        if (getenv("GGML_ALLOC_DUMP")) {
+            fprintf(stderr, "mask-dbg: created 1-element dummy (n_tokens=%d, n_kv=%d)\n", (int)n_tokens, (int)n_kv);
+        }
+        return res;
+    }
+    if (getenv("GGML_ALLOC_DUMP") && n_kv > 0 && (int64_t)n_kv * n_tokens > 1000000000) {
+        fprintf(stderr, "mask-dbg: FULL mask [n_kv=%d x n_tokens=%d] = %.1f GB\n", (int)n_kv, (int)n_tokens, (double)n_kv*n_tokens*2/1e9);
+    }
+
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
@@ -832,6 +858,18 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
 
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
+    // gather-prefill: create a 1-element dummy (same as build_attn_inp_kq_mask)
+    static const bool dsa_gather_prefill = [] {
+        const char * e = getenv("GGML_DSA_GATHER_PREFILL");
+        return e && atoi(e) != 0;
+    }();
+    if (dsa_gather_prefill && n_tokens > 16) {
+        ggml_tensor * res = ggml_new_tensor_1d(ctx, type, 1);
+        ggml_set_input(res);
+        ggml_set_name(res, "attn_inp_kq_mask");
+        return res;
+    }
+
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
@@ -990,6 +1028,20 @@ static void dsv4_build_comp_inputs(
 
         GGML_ASSERT(n_stream > 0);
         GGML_ASSERT(n_tokens%n_stream == 0);
+
+        // Same gather-prefill optimization as build_attn_inp_kq_mask: the DSA gather
+        // path never reads this [n_kv x n_tokens] mask (only scatter does). Replacing it
+        // with a 1-element dummy prevents 128GB+ host allocations and GPU copies at ctx=1M.
+        static const bool dsa_gather_prefill = [] {
+            const char * e = getenv("GGML_DSA_GATHER_PREFILL");
+            return e && atoi(e) != 0;
+        }();
+        if (dsa_gather_prefill && n_tokens > 16) {
+            inp.kq_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_input(inp.kq_mask);
+            ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+            return;
+        }
 
         inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(inp.kq_mask);
