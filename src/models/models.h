@@ -2624,6 +2624,8 @@ struct llama_model_glm5_next : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // layer boundary node indices for streaming execution (GGML_LAYER_STREAMING=1)
+
         // collapse the hc streams with per-stream weights
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,

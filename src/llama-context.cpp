@@ -1750,6 +1750,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf = model.build_graph(gparams);
         llama_moe_cache_graph_built();
 
+        // layer bounds are already filled by the graph builder (s_layer_bounds);
+        // do NOT clear here — graph_compute needs them for streaming execution
+
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
@@ -2953,9 +2956,43 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
-
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
+
+    // When layer streaming is active, reserve the compute buffer for the LARGEST
+    // single layer segment instead of the whole graph. Each layer's sub-graph
+    // reuses the same buffer during sequential execution (see graph_compute).
+    if (!s_layer_bounds.empty() && s_layer_bounds.size() > 1) {
+        // find the largest segment
+        int prev = 0;
+        int max_seg = 0, max_begin = 0, max_end = 0;
+        for (int bound : s_layer_bounds) {
+            if (bound - prev > max_seg) {
+                max_seg = bound - prev;
+                max_begin = prev;
+                max_end = bound;
+            }
+            prev = bound;
+        }
+        // include the tail (output head, etc.)
+        const int total = ggml_graph_n_nodes(gf);
+        if (total - prev > max_seg) {
+            max_seg = total - prev;
+            max_begin = prev;
+            max_end = total;
+        }
+
+        // reserve with just the largest segment's graph
+        if (max_seg > 0 && max_end > max_begin) {
+            LLAMA_LOG_INFO("%s: layer streaming: reserving for largest segment [%d,%d) of %d nodes\n",
+                           __func__, max_begin, max_end, total);
+            if (!ggml_backend_sched_reserve_range(sched.get(), gf, max_begin, max_end)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate streaming compute buffers\n", __func__);
+                return nullptr;
+            }
+            return gf;
+        }
+    }
 
     // initialize scheduler with the specified graph
     if (split_only) {
@@ -2998,6 +3035,8 @@ llm_graph_params llama_context::graph_params(
     };
 }
 
+std::vector<int> llama_context::s_layer_bounds;
+
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
@@ -3015,6 +3054,42 @@ ggml_status llama_context::graph_compute(
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    // Layer-streaming execution: split the graph at layer boundaries and execute
+    // each segment separately. The compute buffer is sized for the largest segment
+    // (one layer's intermediates) instead of the whole graph's peak, freeing ~10GB
+    // of VRAM for the MoE expert cache at large batch sizes.
+    // Only for large batches (prefill); decode uses the normal monolithic path
+    // (45 sequential scheduler calls add ~30ms overhead per token).
+    static const int streaming_min_tokens = [] {
+        const char * e = getenv("GGML_LAYER_STREAMING_MIN_TOKENS");
+        return e ? atoi(e) : 2048;
+    }();
+    // decode (batched=false) or small batches use the normal path; only large prefills stream
+    if (!s_layer_bounds.empty() && s_layer_bounds.size() > 1 && batched) {
+        auto status = GGML_STATUS_SUCCESS;
+        int prev_bound = 0;
+
+        for (size_t seg = 0; seg < s_layer_bounds.size() && status == GGML_STATUS_SUCCESS; seg++) {
+            const int end_bound = s_layer_bounds[seg];
+            if (end_bound <= prev_bound) continue;
+            status = ggml_backend_sched_graph_compute_range(sched.get(), gf, prev_bound, end_bound);
+            if (status != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: segment %zu [%d,%d) failed with %d\n", __func__, seg, prev_bound, end_bound, status);
+            }
+            prev_bound = end_bound;
+        }
+
+        // execute the remaining nodes (output head, sampling, etc.) after the last layer
+        if (prev_bound < ggml_graph_n_nodes(gf) && status == GGML_STATUS_SUCCESS) {
+            status = ggml_backend_sched_graph_compute_range(sched.get(), gf, prev_bound, ggml_graph_n_nodes(gf));
+        }
+
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: streaming compute failed with %d\n", __func__, status);
+        }
+        return status;
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);

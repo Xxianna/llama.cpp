@@ -670,6 +670,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_post(
 llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
 
+    // layer boundary tracking for streaming execution (GGML_LAYER_STREAMING=1)
+    static const bool track_layers = [] {
+        const char * e = getenv("GGML_LAYER_STREAMING");
+        return e && atoi(e) != 0;
+    }();
+    std::vector<int> * layer_bounds = track_layers ? &this->layer_bounds : nullptr;
+
     ggml_tensor * cur;
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
@@ -769,6 +776,11 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
+
+        // record layer boundary for streaming execution (GGML_LAYER_STREAMING)
+        if (layer_bounds) {
+            layer_bounds->push_back(ggml_graph_n_nodes(gf));
+        }
     }
 
     // narrow to the output tokens, then collapse the streams
@@ -983,8 +995,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         if (use_split) {
             auto make_score = [&](ggml_tensor * iq_t, ggml_tensor * pooled_c, ggml_tensor * weights_t, ggml_tensor * mask_t) {
                 ggml_tensor * sc = nullptr;
-                if (cparams.fused_lid && mask_t->type == GGML_TYPE_F16 && !ggml_is_view(mask_t)) {
-                    sc = ggml_lightning_indexer(ctx0, iq_t, pooled_c, weights_t, mask_t);
+                if (cparams.fused_lid) {
+                    // cast the computed mask to f16 for the lightning indexer; the fused op
+                    // avoids materializing the [chunk x tile x n_head] per-head intermediate
+                    ggml_tensor * mask_f16 = mask_t->type == GGML_TYPE_F16 ? mask_t
+                        : ggml_cast(ctx0, mask_t, GGML_TYPE_F16);
+                    sc = ggml_lightning_indexer(ctx0, iq_t, pooled_c, weights_t, mask_f16);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
                 } else {
                     ggml_tensor * q_p = ggml_permute(ctx0, iq_t, 0, 2, 1, 3);
@@ -1252,14 +1268,19 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             const char * e = getenv("GGML_DSA_GATHER_TILE");
             return e ? atoll(e) : 4096;
         }();
+        // chunk the selected-latents dimension: each gather is [kv_lora, sel_chunk, 1, tile]
+        // instead of [kv_lora, n_sel, 1, tile], so k_g is sel_chunk/n_sel of the monolithic size
+        // and gallocr rotates small chunks instead of holding 8+ GB alive per tile.
+        static const int64_t sel_chunk = [] {
+            const char * e = getenv("GGML_DSA_GATHER_CHUNK");
+            return e ? atoll(e) : 256;
+        }();
 
         std::vector<ggml_tensor *> out_tiles;
         for (int64_t tb = 0; tb < n_tokens; tb += gather_tile) {
             const int64_t tn = std::min<int64_t>(gather_tile, n_tokens - tb);
 
             auto sel_t  = ggml_view_2d(ctx0, sel_idx, n_sel, tn, sel_idx->nb[1], tb * sel_idx->nb[1]);
-            // q_absorbed is [kv_lora, n_head, n_tokens, 1]; take the token tile on ne[2] and
-            // put it on ne[3] so mul_mat broadcasts heads against the gathered rows for any tile size.
             auto q_t    = ggml_permute(ctx0,
                     ggml_view_4d(ctx0, q_absorbed, q_absorbed->ne[0], q_absorbed->ne[1], tn, 1,
                         q_absorbed->nb[1], q_absorbed->nb[2], q_absorbed->nb[3], tb * q_absorbed->nb[2]),
@@ -1269,21 +1290,50 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
                     inp_kpool->gather_mask->nb[1], inp_kpool->gather_mask->nb[2], inp_kpool->gather_mask->nb[3],
                     tb * inp_kpool->gather_mask->nb[3]);
 
-            ggml_tensor * k_g = mctx_hyb->gather_mla_rows(ctx0, sel_t, n_sel*tn, kv_lora_rank, il);
-            k_g = ggml_reshape_4d(ctx0, k_g, kv_lora_rank, n_sel, 1, tn); // F32 [kv_lora_rank, n_sel, 1, tn]
-            cb(k_g, "kv_gathered", il);
-
-            ggml_tensor * kq = ggml_mul_mat(ctx0, k_g, q_t);               // [n_sel, 1, n_head, tn]
+            // Pass 1: chunked gather + score, softmax over the full kq (scores are small)
+            ggml_tensor * kq;
+            {
+                std::vector<ggml_tensor *> kq_parts;
+                for (int64_t sc = 0; sc < n_sel; sc += sel_chunk) {
+                    const int64_t sn = std::min(sel_chunk, n_sel - sc);
+                    auto sel_c = ggml_cont(ctx0, ggml_view_2d(ctx0, sel_t, sn, tn, sel_t->nb[1], sc * sel_t->nb[0]));
+                    auto k_g_c = mctx_hyb->gather_mla_rows(ctx0, sel_c, sn*tn, kv_lora_rank, il);
+                    k_g_c = ggml_reshape_4d(ctx0, k_g_c, kv_lora_rank, sn, 1, tn);
+                    cb(k_g_c, "kv_gathered_chunk", il);
+                    kq_parts.push_back(ggml_mul_mat(ctx0, k_g_c, q_t)); // [sn, 1, n_head, tn]
+                }
+                kq = kq_parts[0];
+                for (size_t pi = 1; pi < kq_parts.size(); ++pi) {
+                    kq = ggml_concat(ctx0, kq, kq_parts[pi], 0); // [n_sel, 1, n_head, tn]
+                }
+            }
             ggml_prec_set_acc(kq, GGML_PREC_F32);
             kq = ggml_soft_max_ext(ctx0, kq, gm_t, kq_scale, 0.0f);
             cb(kq, "kq_soft_max_gathered", il);
 
-            ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, k_g)); // [n_sel, kv_lora_rank, 1, tn]
-            ggml_tensor * kqv = ggml_mul_mat(ctx0, v_t, kq);                // [kv_lora_rank, n_head, 1, tn]
-            kqv = ggml_mul_mat(ctx0, layer.wv_b, kqv);                      // [n_embd_head_v, n_head, 1, tn]
+            // Pass 2: chunked re-gather + value projection (kqv = k_g × softmax(kq))
+            ggml_tensor * kqv;
+            {
+                std::vector<ggml_tensor *> parts;
+                for (int64_t sc = 0; sc < n_sel; sc += sel_chunk) {
+                    const int64_t sn = std::min(sel_chunk, n_sel - sc);
+                    auto sel_c = ggml_cont(ctx0, ggml_view_2d(ctx0, sel_t, sn, tn, sel_t->nb[1], sc * sel_t->nb[0]));
+                    auto k_g_c = mctx_hyb->gather_mla_rows(ctx0, sel_c, sn*tn, kv_lora_rank, il);
+                    k_g_c = ggml_reshape_4d(ctx0, k_g_c, kv_lora_rank, sn, 1, tn);
+                    auto kq_c = ggml_view_4d(ctx0, kq, sn, kq->ne[1], kq->ne[2], kq->ne[3],
+                            kq->nb[1], kq->nb[2], kq->nb[3], sc * kq->nb[0]);
+                    auto v_c = ggml_cont(ctx0, ggml_transpose(ctx0, k_g_c)); // [sn, kv_lora, 1, tn]
+                    parts.push_back(ggml_mul_mat(ctx0, v_c, kq_c));
+                }
+                kqv = parts[0];
+                for (size_t pi = 1; pi < parts.size(); ++pi) {
+                    kqv = ggml_add(ctx0, kqv, parts[pi]);
+                }
+                kqv = ggml_mul_mat(ctx0, layer.wv_b, kqv); // [n_embd_head_v, n_head, 1, tn]
+            }
             cb(kqv, "kqv_gathered", il);
 
-            ggml_tensor * out_t = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3)); // [n_embd_head_v, 1, n_head, tn]
+            ggml_tensor * out_t = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
             out_tiles.push_back(ggml_reshape_2d(ctx0, out_t, kqv->ne[0]*n_head, tn));
         }
 

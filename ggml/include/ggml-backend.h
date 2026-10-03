@@ -365,6 +365,20 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // Layer-streaming: execute a node range [begin, end) of the graph as an independent
+    // segment. Resets the scheduler, allocates the segment's tensors (reusing the
+    // pre-reserved buffer sized for the largest segment), and computes it.
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_range(
+                                    ggml_backend_sched_t sched,
+                                    struct ggml_cgraph * graph,
+                                    int node_begin, int node_end);
+
+    // Layer-streaming: reserve compute buffers for a node range instead of the whole graph
+    GGML_API bool                 ggml_backend_sched_reserve_range(
+                                    ggml_backend_sched_t sched,
+                                    struct ggml_cgraph * graph,
+                                    int node_begin, int node_end);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.

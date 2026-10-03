@@ -994,6 +994,10 @@ struct llm_graph_context {
     // taking negative (skipped) expert ids, whose output rows are zeroed
     mutable ggml_backend_t mm_id_backend = nullptr;
 
+    // layer boundary node indices for streaming execution; models that support
+    // layer streaming fill this during graph building (see GGML_LAYER_STREAMING)
+    std::vector<int> layer_bounds;
+
     const llm_arch arch;
 
     const llama_hparams & hparams;

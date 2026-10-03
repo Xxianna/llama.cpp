@@ -380,6 +380,10 @@ private:
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
 
+    // layer boundary node indices for streaming execution (set by the graph builder
+    // when GGML_LAYER_STREAMING=1; graph_compute uses them to execute per layer)
+    static std::vector<int> s_layer_bounds; // set during graph building
+
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
 
