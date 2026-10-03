@@ -479,6 +479,20 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+// liveness profiling state (GGML_ALLOC_LIVENESS=1), see live_* helpers below
+struct live_track {
+    bool enabled;
+    struct ggml_tensor ** t;     // currently live tensors owned by galloc
+    int  * born;                 // node index where each was allocated
+    int    n, cap;
+    size_t live_bytes;
+    size_t peak_bytes;
+    int    peak_idx;             // node index at peak
+    // snapshot of the largest live tensors at the peak
+    struct { const char * name; size_t size; int born; int death; struct ggml_tensor * ptr; } snap[24];
+    int    n_snap;
+};
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
@@ -493,6 +507,9 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    struct live_track lt; // liveness profiling (GGML_ALLOC_LIVENESS=1)
+    int cur_node_idx;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -597,6 +614,96 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor 
 }
 
 // free the extra space at the end if the new tensor is smaller
+// --- liveness profiling (GGML_ALLOC_LIVENESS=1) -----------------------------
+// Tracks live bytes across the reserve-time planning pass to separate true
+// dataflow liveness (streaming cannot go below this) from allocator
+// fragmentation (fixable). Prints peak, its location, and the live set.
+
+static void live_add(struct live_track * lt, struct ggml_tensor * t, int idx) {
+    if (!lt->enabled) return;
+    if (lt->n == lt->cap) {
+        lt->cap = lt->cap ? lt->cap * 2 : 1024;
+        lt->t    = realloc(lt->t, sizeof(*lt->t) * lt->cap);
+        lt->born = realloc(lt->born, sizeof(int) * lt->cap);
+        GGML_ASSERT(lt->t && lt->born);
+    }
+    lt->t[lt->n] = t;
+    lt->born[lt->n] = idx;
+    lt->n++;
+    lt->live_bytes += ggml_nbytes(t);
+}
+
+static void live_remove(struct live_track * lt, struct ggml_tensor * t, int idx) {
+    if (!lt->enabled) return;
+    for (int i = 0; i < lt->n; i++) {
+        if (lt->t[i] == t) {
+            lt->live_bytes -= ggml_nbytes(t);
+            lt->t[i]    = lt->t[lt->n - 1];
+            lt->born[i] = lt->born[lt->n - 1];
+            lt->n--;
+            // record the death point if this tensor is in the peak snapshot
+            for (int j = 0; j < lt->n_snap; j++) {
+                if (lt->snap[j].ptr == t) lt->snap[j].death = idx;
+            }
+            return;
+        }
+    }
+}
+
+static void live_peak_check(struct live_track * lt, int idx) {
+    if (!lt->enabled || lt->live_bytes <= lt->peak_bytes) return;
+    lt->peak_bytes = lt->live_bytes;
+    lt->peak_idx = idx;
+    // snapshot the largest live tensors
+    int n = 0;
+    size_t min_seen = SIZE_MAX;
+    for (int i = 0; i < lt->n; i++) {
+        size_t sz = ggml_nbytes(lt->t[i]);
+        if (n < (int)(sizeof(lt->snap) / sizeof(lt->snap[0]))) {
+            lt->snap[n].name = lt->t[i]->name[0] ? lt->t[i]->name : "(unnamed)";
+            lt->snap[n].size = sz;
+            lt->snap[n].born = lt->born[i];
+            lt->snap[n].death = -1;
+            lt->snap[n].ptr = lt->t[i];
+            if (sz < min_seen) min_seen = sz;
+            n++;
+        } else if (sz > min_seen) {
+            // replace the smallest entry
+            int smallest = 0;
+            for (int j = 1; j < n; j++) {
+                if (lt->snap[j].size < lt->snap[smallest].size) smallest = j;
+            }
+            lt->snap[smallest].name = lt->t[i]->name[0] ? lt->t[i]->name : "(unnamed)";
+            lt->snap[smallest].size = sz;
+            lt->snap[smallest].born = lt->born[i];
+            lt->snap[smallest].death = -1;
+            lt->snap[smallest].ptr = lt->t[i];
+            min_seen = SIZE_MAX;
+            for (int j = 0; j < n; j++) min_seen = MIN(min_seen, lt->snap[j].size);
+        }
+    }
+    lt->n_snap = n;
+}
+
+static void live_report(struct live_track * lt, int n_nodes) {
+    if (!lt->enabled) return;
+    fprintf(stderr, "liveness: peak %.2f GiB at node %d/%d, %d tensors live at peak, end-live %.2f GiB\n",
+        lt->peak_bytes / 1073741824.0, lt->peak_idx, n_nodes, lt->n_snap, lt->live_bytes / 1073741824.0);
+    fprintf(stderr, "liveness: top live tensors at peak (size, born, death, op, shape, name):\n");
+    for (int i = 0; i < lt->n_snap; i++) {
+        struct ggml_tensor * t = lt->snap[i].ptr;
+        fprintf(stderr, "  [%7.1f MiB born %6d death %6d] %s [%lldx%lldx%lldx%lld] %s\n",
+            lt->snap[i].size / 1048576.0, lt->snap[i].born, lt->snap[i].death,
+            t ? ggml_op_desc(t) : "?",
+            t ? (long long)t->ne[0] : 0, t ? (long long)t->ne[1] : 0,
+            t ? (long long)t->ne[2] : 0, t ? (long long)t->ne[3] : 0,
+            lt->snap[i].name);
+    }
+    free(lt->t);
+    free(lt->born);
+}
+// ---------------------------------------------------------------------------
+
 static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
     struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
@@ -665,6 +772,8 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                             hn->addr = p_hn->addr;
                             p_hn->allocated = false; // avoid freeing the parent
                             view_src_hn->allocated = false;
+                            live_remove(&galloc->lt, view_src, galloc->cur_node_idx);
+                            live_add(&galloc->lt, node, galloc->cur_node_idx);
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
                             return;
                         }
@@ -673,6 +782,8 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                         hn->buffer_id = p_hn->buffer_id;
                         hn->addr = p_hn->addr;
                         p_hn->allocated = false; // avoid freeing the parent
+                        live_remove(&galloc->lt, parent, galloc->cur_node_idx);
+                        live_add(&galloc->lt, node, galloc->cur_node_idx);
                         ggml_gallocr_free_extra_space(galloc, node, parent);
                         return;
                     }
@@ -685,6 +796,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+        live_add(&galloc->lt, node, galloc->cur_node_idx);
     }
 }
 
@@ -709,6 +821,7 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
 
     ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
     hn->allocated = false;
+    live_remove(&galloc->lt, node, galloc->cur_node_idx);
 }
 
 static int get_node_buffer_id(const int * node_buffer_ids, int i) {
@@ -719,6 +832,16 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+
+    // liveness profiling is re-initialized per planning pass
+    galloc->lt.enabled = getenv("GGML_ALLOC_LIVENESS") != NULL;
+    galloc->lt.n = galloc->lt.cap = 0;
+    galloc->lt.t = NULL;
+    galloc->lt.born = NULL;
+    galloc->lt.live_bytes = galloc->lt.peak_bytes = 0;
+    galloc->lt.peak_idx = -1;
+    galloc->lt.n_snap = 0;
+    galloc->cur_node_idx = -1;
 
     // allocate leafs
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
@@ -764,6 +887,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int buffer_id = get_node_buffer_id(node_buffer_ids, i);
+        galloc->cur_node_idx = i;
 
         // allocate parents (only leafs need to be allocated at this point)
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -776,6 +900,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
         // allocate node
         ggml_gallocr_allocate_node(galloc, node, buffer_id);
+        live_peak_check(&galloc->lt, i);
 
         AT_PRINTF("exec: %s (%s) <= ", ggml_op_desc(node), node->name);
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -818,6 +943,36 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
                 }
             }
             AT_PRINTF("\n");
+        }
+    }
+
+    live_report(&galloc->lt, graph->n_nodes);
+
+    // GGML_ALLOC_LIVENESS=2: dump node details at interesting indexes and
+    // map every consumer of those nodes' tensors.
+    if (galloc->lt.enabled && getenv("GGML_ALLOC_LIVENESS")[0] >= '2' && graph->n_nodes > 10000) {
+        const int spots[] = { 459, 6898, 7077, 7158, 7266 };
+        for (size_t s = 0; s < sizeof(spots)/sizeof(spots[0]); s++) {
+            int i = spots[s];
+            if (i >= graph->n_nodes) continue;
+            struct ggml_tensor * n = graph->nodes[i];
+            fprintf(stderr, "node %d: %s [%lldx%lldx%lldx%lld] name=%s\n", i, ggml_op_desc(n),
+                (long long)n->ne[0], (long long)n->ne[1], (long long)n->ne[2], (long long)n->ne[3],
+                n->name[0] ? n->name : "-");
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (!n->src[j]) continue;
+                fprintf(stderr, "   src%d: %s [%lldx%lldx%lldx%lld] name=%s\n", j, ggml_op_desc(n->src[j]),
+                    (long long)n->src[j]->ne[0], (long long)n->src[j]->ne[1], (long long)n->src[j]->ne[2], (long long)n->src[j]->ne[3],
+                    n->src[j]->name[0] ? n->src[j]->name : "-");
+            }
+            fprintf(stderr, "   consumers of node %d:", i);
+            for (int k = 0; k < graph->n_nodes; k++) {
+                struct ggml_tensor * m = graph->nodes[k];
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    if (m->src[j] == n) { fprintf(stderr, " %d(%s)", k, ggml_op_desc(m)); break; }
+                }
+            }
+            fprintf(stderr, "\n");
         }
     }
 }

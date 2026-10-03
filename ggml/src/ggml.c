@@ -7297,6 +7297,7 @@ static void ggml_compute_backward(
 }
 
 static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_tensor * node, bool compute) {
+
     if (node->op != GGML_OP_NONE && compute) {
         node->flags |= GGML_TENSOR_FLAG_COMPUTE;
     }

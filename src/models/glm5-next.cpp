@@ -670,12 +670,6 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_post(
 llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
 
-    // layer boundary tracking for streaming execution (GGML_LAYER_STREAMING=1)
-    static const bool track_layers = [] {
-        const char * e = getenv("GGML_LAYER_STREAMING");
-        return e && atoi(e) != 0;
-    }();
-    std::vector<int> * layer_bounds = track_layers ? &this->layer_bounds : nullptr;
 
     ggml_tensor * cur;
 
@@ -777,10 +771,6 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
 
-        // record layer boundary for streaming execution (GGML_LAYER_STREAMING)
-        if (layer_bounds) {
-            layer_bounds->push_back(ggml_graph_n_nodes(gf));
-        }
     }
 
     // narrow to the output tokens, then collapse the streams
@@ -907,12 +897,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_pool         = inp_kpool->pool_cells->ne[0];
     const int64_t n_new          = inp_kpool->n_new;
 
+    // NOTE: the full iq [n_embd_indexer, n_head, n_tokens] is 8+ GiB at f32 x 65536 tokens.
+    // The split-score path computes it per token tile instead (see make_iq_tile); only the
+    // monolithic path materializes it.
     ggml_tensor * iq = nullptr;
-    if (inp_kpool->reuse_sel == nullptr) {
-        iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
-        iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n_tokens);
-        cb(iq, "indexer_q", il);
-    }
 
     // Per-token key and pool gate scores, cached together
     ggml_tensor * ik = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
@@ -993,6 +981,15 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
             !inp_kpool->chunk_bounds.empty() && n_tokens > kpool_split_tokens;
 
         if (use_split) {
+            // per-tile indexer query: [n_embd_indexer, n_head, tn], computed from the qr tile
+            // instead of viewing the full 8 GiB iq
+            auto make_iq_tile = [&](int64_t t0, int64_t tn) {
+                auto qr_t = ggml_view_2d(ctx0, qr, qr->ne[0], tn, qr->nb[1], t0 * qr->nb[1]);
+                auto iq_t = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr_t);
+                iq_t = ggml_reshape_3d(ctx0, iq_t, n_embd_indexer, n_indexer_head, tn);
+                return iq_t;
+            };
+
             auto make_score = [&](ggml_tensor * iq_t, ggml_tensor * pooled_c, ggml_tensor * weights_t, ggml_tensor * mask_t) {
                 ggml_tensor * sc = nullptr;
                 if (cparams.fused_lid) {
@@ -1029,7 +1026,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
                 const int64_t t0 = t * kpool_split_tokens;
                 const int64_t tn = std::min<int64_t>(kpool_split_tokens, n_tokens - t0);
 
-                auto iq_t = ggml_view_3d(ctx0, iq, iq->ne[0], iq->ne[1], tn, iq->nb[1], iq->nb[2], t0 * iq->nb[2]);
+                auto iq_t = make_iq_tile(t0, tn);
                 auto w_t  = ggml_view_2d(ctx0, weights, weights->ne[0], tn, weights->nb[1], t0 * weights->nb[1]);
                 auto nvis_t = ggml_view_1d(ctx0, pool_nvis, tn, t0 * pool_nvis->nb[0]); // [tn]
 
@@ -1105,6 +1102,11 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
                 sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
             }
         } else {
+        // monolithic score path: materialize the full indexer query here
+        iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
+        iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n_tokens);
+        cb(iq, "indexer_q", il);
+
         ggml_tensor * score = nullptr;
         if (cparams.fused_lid) {
             score = ggml_lightning_indexer(ctx0, iq, pooled, weights, inp_kpool->pool_mask);
@@ -1213,19 +1215,24 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "q_resid", il);
 
-    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
-    q = ggml_reshape_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens);
-
     ggml_tensor * kv_cmpr = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
     kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
     kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
     cb(kv_cmpr, "kv_cmpr", il);
 
-    // absorb wk_b so the cache holds only the latent
-    ggml_tensor * q_absorbed = ggml_permute(ctx0, q, 0, 2, 1, 3);
-    q_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_absorbed);
-    q_absorbed = ggml_permute(ctx0, q_absorbed, 0, 2, 1, 3);
-    cb(q_absorbed, "q_absorbed", il);
+    // absorb wk_b so the cache holds only the latent.
+    // the gather path computes q_absorbed per tile (the full tensor is 8+ GiB at 65536 tokens);
+    // only the scatter path materializes it
+    ggml_tensor * q_absorbed = nullptr;
+    if (!inp_kpool->gather) {
+        ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
+        q = ggml_reshape_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens);
+
+        q_absorbed = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        q_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_absorbed);
+        q_absorbed = ggml_permute(ctx0, q_absorbed, 0, 2, 1, 3);
+        cb(q_absorbed, "q_absorbed", il);
+    }
 
     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
 
@@ -1238,7 +1245,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         sel = *prev_sel;
     }
 
-    ggml_build_forward_expand(gf, q_absorbed);
+    if (q_absorbed) {
+        // scatter path only; the gather path builds q_absorbed per tile inside the tile loop
+        ggml_build_forward_expand(gf, q_absorbed);
+    }
     ggml_build_forward_expand(gf, kv_cmpr);
     ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, kv_cmpr, inp_attn->get_k_idxs(), il));
 
@@ -1281,10 +1291,16 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             const int64_t tn = std::min<int64_t>(gather_tile, n_tokens - tb);
 
             auto sel_t  = ggml_view_2d(ctx0, sel_idx, n_sel, tn, sel_idx->nb[1], tb * sel_idx->nb[1]);
-            auto q_t    = ggml_permute(ctx0,
-                    ggml_view_4d(ctx0, q_absorbed, q_absorbed->ne[0], q_absorbed->ne[1], tn, 1,
-                        q_absorbed->nb[1], q_absorbed->nb[2], q_absorbed->nb[3], tb * q_absorbed->nb[2]),
-                    0, 2, 3, 1); // [kv_lora, 1, n_head, tn]
+            // per-tile q_absorbed: [kv_lora, tn, 1, n_head], computed from the qr tile instead of
+            // viewing the full 8 GiB tensor
+            auto qr_t   = ggml_view_2d(ctx0, qr, qr->ne[0], tn, qr->nb[1], tb * qr->nb[1]);
+            auto q_t    = ggml_mul_mat(ctx0, layer.wq_b, qr_t);
+            q_t = ggml_reshape_3d(ctx0, q_t, n_embd_head_qk_nope, n_head, tn);
+            q_t = ggml_permute(ctx0, q_t, 0, 2, 1, 3);
+            q_t = ggml_mul_mat(ctx0, layer.wk_b, q_t);
+            q_t = ggml_permute(ctx0, q_t, 0, 2, 1, 3);
+            q_t = ggml_permute(ctx0, q_t, 0, 2, 3, 1); // [kv_lora, tn, 1, n_head]
+            cb(q_t, "q_absorbed_tile", il);
             auto gm_t   = ggml_view_4d(ctx0, inp_kpool->gather_mask,
                     inp_kpool->gather_mask->ne[0], inp_kpool->gather_mask->ne[1], inp_kpool->gather_mask->ne[2], tn,
                     inp_kpool->gather_mask->nb[1], inp_kpool->gather_mask->nb[2], inp_kpool->gather_mask->nb[3],
@@ -1333,8 +1349,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             }
             cb(kqv, "kqv_gathered", il);
 
+            // apply wo per tile: the concat chain then assembles [n_embd, n_tokens] tiles
+            // (1 GiB at 65536) instead of [kqv*n_head, n_tokens] (4 GiB tiles, 8 GiB chain peak)
             ggml_tensor * out_t = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
-            out_tiles.push_back(ggml_reshape_2d(ctx0, out_t, kqv->ne[0]*n_head, tn));
+            out_t = ggml_reshape_2d(ctx0, out_t, kqv->ne[0]*n_head, tn);
+            out_t = ggml_mul_mat(ctx0, layer.wo, out_t); // [n_embd, tn], wo already applied
+            out_tiles.push_back(out_t);
         }
 
         out = out_tiles[0];
@@ -1353,7 +1373,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     }
     cb(out, "kqv_out", il);
 
-    out = ggml_mul_mat(ctx0, layer.wo, out);
+    // the gather path applied wo per tile already
+    if (!inp_kpool->gather) {
+        out = ggml_mul_mat(ctx0, layer.wo, out);
+    }
     cb(out, "attn_out", il);
 
     return out;

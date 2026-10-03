@@ -2832,21 +2832,6 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     return true;
 }
 
-bool ggml_backend_sched_reserve_range(ggml_backend_sched_t sched, struct ggml_cgraph * graph, int node_begin, int node_end) {
-    GGML_ASSERT(sched);
-    GGML_ASSERT(graph);
-    GGML_ASSERT(node_begin >= 0 && node_begin < graph->n_nodes);
-    GGML_ASSERT(node_end > node_begin && node_end <= graph->n_nodes);
-
-    // build a sub-graph covering only [begin, end) — the buffer is sized for this
-    // segment (the largest single layer) rather than the whole graph's peak
-    struct ggml_cgraph sub = *graph;
-    sub.n_nodes = node_end - node_begin;
-    sub.nodes   = graph->nodes + node_begin;
-
-    return ggml_backend_sched_reserve(sched, &sub);
-}
-
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
@@ -2884,27 +2869,6 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
-}
-
-enum ggml_status ggml_backend_sched_graph_compute_range(
-        ggml_backend_sched_t sched, struct ggml_cgraph * graph, int node_begin, int node_end) {
-    GGML_ASSERT(sched);
-    GGML_ASSERT(graph);
-    GGML_ASSERT(node_begin >= 0 && node_begin < graph->n_nodes);
-    GGML_ASSERT(node_end > node_begin && node_end <= graph->n_nodes);
-
-    // build a sub-graph covering nodes [begin, end); the sub-graph shares the
-    // parent's leafs and hash set — only the node range differs
-    struct ggml_cgraph sub = *graph;
-    sub.n_nodes = node_end - node_begin;
-    sub.nodes   = graph->nodes + node_begin;
-
-    // reset assignment state (keeps the pre-reserved buffers) and run this segment
-    ggml_backend_sched_reset(sched);
-    if (!ggml_backend_sched_alloc_graph(sched, &sub)) {
-        return GGML_STATUS_ALLOC_FAILED;
-    }
     return ggml_backend_sched_compute_splits(sched);
 }
 
