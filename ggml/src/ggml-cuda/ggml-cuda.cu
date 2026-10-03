@@ -1899,6 +1899,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        if (getenv("GGML_MMVQ_DEBUG")) {
+            fprintf(stderr, "mmvq-mm: src0 '%s' [%lld,%lld,%lld,%lld] type=%d src1 '%s' [%lld,%lld,%lld,%lld] ne11=%lld\n",
+                    src0->name, (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3], (int)src0->type,
+                    src1->name, (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], (long long)src1->ne[3],
+                    (long long)ne11);
+        }
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -1963,6 +1969,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    // stage-debug: identify which mul_mat_id hits the crashing MMVQ path
+                    if (getenv("GGML_MMVQ_DEBUG")) {
+                        fprintf(stderr, "mmvq-id: src0 '%s' [%lld,%lld,%lld,%lld] type=%d src1 '%s' [%lld,%lld,%lld,%lld] ne2=%lld\n",
+                                src0->name, (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3], (int)src0->type,
+                                src1->name, (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], (long long)src1->ne[3],
+                                (long long)ne2);
+                    }
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }

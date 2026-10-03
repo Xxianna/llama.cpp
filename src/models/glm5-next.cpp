@@ -1187,7 +1187,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         // Attend over gathered latents with the token dimension in ne[3].
         // The gathered latents are 4+ MB per token, so the token dimension is processed in
         // tiles: peak scratch is n_sel*tile instead of n_sel*n_tokens (env GGML_DSA_GATHER_TILE).
-        // Note: the [n_kv x n_tokens] kq_mask is NOT expanded here — only the scatter path reads it.
+        // The [n_kv x n_tokens] kq_mask lives on the host and is filled by set_input even in
+        // gather mode (its buffer must be allocated or set_input aborts); only scatter reads it.
+
+        ggml_build_forward_expand(gf, kq_mask);
 
         ggml_tensor * sel_idx = sel; // I32 [n_sel, n_tokens]
         const int64_t n_sel = sel_idx->ne[0];
