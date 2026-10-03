@@ -58,7 +58,14 @@ static ggml_tensor * build_attn_inp_kq_mask(
         const char * e = getenv("GGML_DSA_GATHER_PREFILL");
         return e && atoi(e) != 0;
     }();
-    if (dsa_gather_prefill && (int64_t) n_tokens > 16) {
+    // only create the dummy for batches large enough to take the split-score path
+    // (where the dense mask is never read); smaller batches may still take the scatter
+    // path (e.g. when n_kv < n_sel early in the context) and need the real mask
+    static const int64_t dummy_threshold = [] {
+        const char * e = getenv("GGML_KPOOL_SPLIT_TOKENS");
+        return e ? atoll(e) : 8192;
+    }();
+    if (dsa_gather_prefill && (int64_t) n_tokens > dummy_threshold) {
         ggml_tensor * res = ggml_new_tensor_1d(ctx, type, 1);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_kq_mask");
@@ -863,7 +870,11 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
         const char * e = getenv("GGML_DSA_GATHER_PREFILL");
         return e && atoi(e) != 0;
     }();
-    if (dsa_gather_prefill && n_tokens > 16) {
+    static const int64_t dummy_threshold = [] {
+        const char * e = getenv("GGML_KPOOL_SPLIT_TOKENS");
+        return e ? atoll(e) : 8192;
+    }();
+    if (dsa_gather_prefill && n_tokens > dummy_threshold) {
         ggml_tensor * res = ggml_new_tensor_1d(ctx, type, 1);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_kq_mask");
@@ -1036,7 +1047,8 @@ static void dsv4_build_comp_inputs(
             const char * e = getenv("GGML_DSA_GATHER_PREFILL");
             return e && atoi(e) != 0;
         }();
-        if (dsa_gather_prefill && n_tokens > 16) {
+        static const int64_t dummy_threshold = [] { const char *e = getenv("GGML_KPOOL_SPLIT_TOKENS"); return e ? atoll(e) : 8192; }();
+        if (dsa_gather_prefill && n_tokens > dummy_threshold) {
             inp.kq_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
             ggml_set_input(inp.kq_mask);
             ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
