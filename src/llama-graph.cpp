@@ -2786,6 +2786,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
     ggml_tensor * experts = nullptr;
+    bool moe_tiled = false;
+    std::vector<ggml_tensor *> moe_tile_downs;
     if (!parts.empty()) {
         // id in [lo, hi) -> kept, else -1 (on the integer-valued floats: clamp(id - lo + 1, 0, 1) * clamp(hi - id, 0, 1))
         ggml_tensor * f  = ggml_cast(ctx0, ggml_cont(ctx0, selected_experts), GGML_TYPE_F32);
@@ -2829,10 +2831,81 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(moe_out, "ffn_moe_out", il);
         return moe_out;
     } else {
-        experts = expert_chain(cur, selected_experts);
+        // Tile the routed-expert chain by tokens at large batches. Every op in the chain
+        // (mul_mat_id, activation, weighted merge) is per-token, but the full-width chain
+        // materializes [n_embd, n_expert_used, n_tokens] f32 activations — ~28 GiB at
+        // 65536 tokens for GLM-5.3-Flash — in the expert backend's compute buffer.
+        // Tiling keeps only [*, n_expert_used, tile] slices alive (LLAMA_MOE_TILE_TOKENS).
+        static const int64_t moe_tile = [] {
+            const char * e = getenv("LLAMA_MOE_TILE_TOKENS");
+            // default off: on CUDA the tiled chain corrupts output for n_tokens > tile
+            // (CPU is bit-correct; suspected async-copy race across the per-tile splits —
+            // see STREAMING_TODO.md §MoE tiling). Opt in explicitly.
+            return e ? atoll(e) : 0;
+        }();
+        const uint32_t n_used_il = hparams.n_expert_used(il);
+        const bool can_tile = moe_tile > 0 && n_tokens > moe_tile &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
+            !up_exps_s && !gate_exps_s && !down_exps_s && !weight_before_ffn;
+        if (can_tile) {
+            std::vector<ggml_tensor *> tile_outs;
+            // the predictor (src[4]) and the full-selection handoff (src[5], set below via
+            // moe_tile_downs) are full-width per-token tables; a tile's gate op indexes them
+            // with tile-local token ids and would read the WRONG tokens' rows, making the
+            // cache serve wrong experts. Suppress both for tiled chains — the predictor only
+            // matters for decode, which never tiles (n_tokens small).
+            ggml_tensor * mc_pred_saved = mc_pred;
+            mc_pred = nullptr;
+            for (int64_t t0 = 0; t0 < n_tokens; t0 += moe_tile) {
+                const int64_t tn = std::min<int64_t>(moe_tile, n_tokens - t0);
+                auto cur_t = ggml_view_3d(ctx0, cur, cur->ne[0], cur->ne[1], tn,
+                                          cur->nb[1], cur->nb[2], t0 * cur->nb[2]);
+                auto ids_t = ggml_view_2d(ctx0, selected_experts, selected_experts->ne[0], tn,
+                                          selected_experts->nb[1], t0 * selected_experts->nb[1]);
+                ggml_tensor * e = expert_chain(cur_t, ids_t); // [n_embd, n_used, tn]
+                if (mcache) {
+                    e->src[3] = mcache->host_table;
+                    e->op_params[0] = mcache->n_slots;
+                    if (mc_cpu_backend) {
+                        ggml_backend_sched_set_tensor_backend(sched, e, mc_cpu_backend);
+                    }
+                    if (down_g) {
+                        ggml_tensor * dg_t = ggml_view_3d(ctx0, down_g, down_g->ne[0], down_g->ne[1], tn,
+                                                          down_g->nb[1], down_g->nb[2], t0 * down_g->nb[2]);
+                        e = ggml_add(ctx0, e, dg_t);
+                        cb(e, "ffn_moe_cache_merged_t", il);
+                    }
+                }
+                e = ggml_mul(ctx0, e, ggml_view_3d(ctx0, weights, weights->ne[0], weights->ne[1], tn,
+                                                   weights->nb[1], weights->nb[2], t0 * weights->nb[2]));
+                cb(e, "ffn_moe_weighted_t", il);
+                ggml_build_forward_expand(gf, e);
+                ggml_tensor * out_t = nullptr;
+                for (uint32_t i = 0; i < n_used_il; ++i) {
+                    ggml_tensor * v = ggml_view_2d(ctx0, e, n_embd, tn, e->nb[2], i * e->nb[1]);
+                    ggml_build_forward_expand(gf, v);
+                    out_t = out_t ? ggml_add(ctx0, out_t, v) : ggml_cont(ctx0, v);
+                }
+                // expand the tile's reduce here, inside the loop: otherwise every tile's
+                // weighted activation stays live until the final concat expand (16 x 512 MiB
+                // pinned at LLAMA_MOE_TILE_TOKENS=4096) — sequential tiles must die per tile
+                out_t = ggml_reshape_2d(ctx0, out_t, n_embd, tn);
+                ggml_build_forward_expand(gf, out_t);
+                tile_outs.push_back(out_t);
+            }
+            mc_pred = mc_pred_saved;
+            ggml_tensor * moe_out_t = tile_outs[0];
+            for (size_t i = 1; i < tile_outs.size(); ++i) {
+                moe_out_t = ggml_concat(ctx0, moe_out_t, tile_outs[i], 1);
+            }
+            experts = moe_out_t;
+            moe_tiled = true;
+        } else {
+            experts = expert_chain(cur, selected_experts);
+        }
     }
 
-    if (mcache) {
+    if (mcache && !moe_tiled) {
         experts->src[3] = mcache->host_table;
         experts->op_params[0] = mcache->n_slots;
         if (mc_cpu_backend) {
@@ -2930,13 +3003,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    if (!weight_before_ffn) {
+    if (!weight_before_ffn && !moe_tiled) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 
     ggml_build_forward_expand(gf, experts);
 
+    ggml_tensor * moe_out = nullptr;
+
+    if (moe_tiled) {
+        // already reduced per tile to [n_embd, tile] and concatenated
+        moe_out = experts;
+    } else {
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
     assert(n_expert_used > 0);
@@ -2953,7 +3032,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // aggregate experts
-    ggml_tensor * moe_out = cur_experts[0];
+    moe_out = cur_experts[0];
 
     for (uint32_t i = 1; i < n_expert_used_il; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
@@ -2964,6 +3043,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (n_expert_used_il == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
+    }
     }
 
     if (defer_prev) {

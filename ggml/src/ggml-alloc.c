@@ -491,6 +491,11 @@ struct live_track {
     // snapshot of the largest live tensors at the peak
     struct { const char * name; size_t size; int born; int death; struct ggml_tensor * ptr; } snap[24];
     int    n_snap;
+    // GPU-proxy: same tracking but excluding the --cpu-moe host-side MoE path
+    // (uncached ffn_moe_* activations), approximating what lives in the CUDA buffer
+    size_t live_bytes_nm;
+    size_t peak_bytes_nm;
+    int    peak_idx_nm;
 };
 
 struct ggml_gallocr {
@@ -619,6 +624,13 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor 
 // dataflow liveness (streaming cannot go below this) from allocator
 // fragmentation (fixable). Prints peak, its location, and the live set.
 
+static bool live_is_moe_host(const struct ggml_tensor * t) {
+    // uncached expert path under --cpu-moe: mul_mat_id outputs and their named
+    // downstream activations run on the CPU backend and land in host memory
+    return t->op == GGML_OP_MUL_MAT_ID ||
+        (t->name[0] == 'f' && strncmp(t->name, "ffn_moe", 7) == 0);
+}
+
 static void live_add(struct live_track * lt, struct ggml_tensor * t, int idx) {
     if (!lt->enabled) return;
     if (lt->n == lt->cap) {
@@ -631,6 +643,7 @@ static void live_add(struct live_track * lt, struct ggml_tensor * t, int idx) {
     lt->born[lt->n] = idx;
     lt->n++;
     lt->live_bytes += ggml_nbytes(t);
+    if (!live_is_moe_host(t)) lt->live_bytes_nm += ggml_nbytes(t);
 }
 
 static void live_remove(struct live_track * lt, struct ggml_tensor * t, int idx) {
@@ -638,6 +651,7 @@ static void live_remove(struct live_track * lt, struct ggml_tensor * t, int idx)
     for (int i = 0; i < lt->n; i++) {
         if (lt->t[i] == t) {
             lt->live_bytes -= ggml_nbytes(t);
+            if (!live_is_moe_host(t)) lt->live_bytes_nm -= ggml_nbytes(t);
             lt->t[i]    = lt->t[lt->n - 1];
             lt->born[i] = lt->born[lt->n - 1];
             lt->n--;
@@ -651,7 +665,12 @@ static void live_remove(struct live_track * lt, struct ggml_tensor * t, int idx)
 }
 
 static void live_peak_check(struct live_track * lt, int idx) {
-    if (!lt->enabled || lt->live_bytes <= lt->peak_bytes) return;
+    if (!lt->enabled) return;
+    if (lt->live_bytes_nm > lt->peak_bytes_nm) {
+        lt->peak_bytes_nm = lt->live_bytes_nm;
+        lt->peak_idx_nm = idx;
+    }
+    if (lt->live_bytes <= lt->peak_bytes) return;
     lt->peak_bytes = lt->live_bytes;
     lt->peak_idx = idx;
     // snapshot the largest live tensors
@@ -689,6 +708,8 @@ static void live_report(struct live_track * lt, int n_nodes) {
     if (!lt->enabled) return;
     fprintf(stderr, "liveness: peak %.2f GiB at node %d/%d, %d tensors live at peak, end-live %.2f GiB\n",
         lt->peak_bytes / 1073741824.0, lt->peak_idx, n_nodes, lt->n_snap, lt->live_bytes / 1073741824.0);
+    fprintf(stderr, "liveness: gpu-proxy peak (excl. cpu-moe host path) %.2f GiB at node %d/%d\n",
+        lt->peak_bytes_nm / 1073741824.0, lt->peak_idx_nm, n_nodes);
     fprintf(stderr, "liveness: top live tensors at peak (size, born, death, op, shape, name):\n");
     for (int i = 0; i < lt->n_snap; i++) {
         struct ggml_tensor * t = lt->snap[i].ptr;
@@ -841,6 +862,8 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     galloc->lt.live_bytes = galloc->lt.peak_bytes = 0;
     galloc->lt.peak_idx = -1;
     galloc->lt.n_snap = 0;
+    galloc->lt.live_bytes_nm = galloc->lt.peak_bytes_nm = 0;
+    galloc->lt.peak_idx_nm = -1;
     galloc->cur_node_idx = -1;
 
     // allocate leafs

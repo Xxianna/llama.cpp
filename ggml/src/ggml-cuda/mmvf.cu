@@ -711,6 +711,13 @@ static void mul_mat_vec_f_cuda(
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (getenv("GGML_MMVF_DEBUG")) {
+        fprintf(stderr, "mmvf: dst=%s[%lldx%lldx%lldx%lld] src0=%s[%lldx%lldx%lldx%lld] src1=%s[%lldx%lldx%lldx%lld] nb11=%lld ids=%s\n",
+            dst->name, (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2], (long long)dst->ne[3],
+            src0->name, (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2], (long long)src0->ne[3],
+            src1->name, (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], (long long)src1->ne[3],
+            (long long)src1->nb[1], ids ? ids->name : "-");
+    }
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);

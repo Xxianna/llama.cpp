@@ -1336,8 +1336,11 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
                     auto sel_c = ggml_cont(ctx0, ggml_view_2d(ctx0, sel_t, sn, tn, sel_t->nb[1], sc * sel_t->nb[0]));
                     auto k_g_c = mctx_hyb->gather_mla_rows(ctx0, sel_c, sn*tn, kv_lora_rank, il);
                     k_g_c = ggml_reshape_4d(ctx0, k_g_c, kv_lora_rank, sn, 1, tn);
-                    auto kq_c = ggml_view_4d(ctx0, kq, sn, kq->ne[1], kq->ne[2], kq->ne[3],
-                            kq->nb[1], kq->nb[2], kq->nb[3], sc * kq->nb[0]);
+                    // n_sel = kpool*n_top + (kpool-1) is odd (2051): the parent row stride
+                    // 2051*4 B violates the CUDA mmvf even-stride assert, so materialize the
+                    // chunk contiguously (64 MiB transient, <1% of batch traffic)
+                    auto kq_c = ggml_cont(ctx0, ggml_view_4d(ctx0, kq, sn, kq->ne[1], kq->ne[2], kq->ne[3],
+                            kq->nb[1], kq->nb[2], kq->nb[3], sc * kq->nb[0]));
                     auto v_c = ggml_cont(ctx0, ggml_transpose(ctx0, k_g_c)); // [sn, kv_lora, 1, tn]
                     parts.push_back(ggml_mul_mat(ctx0, v_c, kq_c));
                 }
