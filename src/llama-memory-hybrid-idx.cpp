@@ -1114,7 +1114,7 @@ size_t llama_memory_hybrid_idx_context::get_mtp_dsa_selection_size() const {
     return mem != nullptr ? mem->get_mtp_dsa_selection().size() : 0;
 }
 
-void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
+void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * pool_nvis, ggml_tensor * tail_idxs,
         ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
         const llama_ubatch * ubatch) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
@@ -1266,13 +1266,21 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             const llama_seq_id s = ubatch->seq_id[i][0];
             const llama_pos    p = ubatch->pos[i];
 
-            T * row = data + (size_t) i*n_pool;
-            std::fill(row, row + n_pool, drop);
-
             const uint32_t p0 = seq_pool_start[s];
             const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
             const uint32_t nv = (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
-            std::fill(row + p0, row + p0 + nv, keep);
+
+            // dense mask (only when pool_mask is full-size, not the split-score dummy)
+            if ((size_t) pool_mask->ne[0] * pool_mask->ne[1] > 1) {
+                T * row = data + (size_t) i*n_pool;
+                std::fill(row, row + n_pool, drop);
+                std::fill(row + p0, row + p0 + nv, keep);
+            }
+
+            // per-token visible count (used by the split-score path's GPU-computed masks)
+            if (pool_nvis != nullptr && pool_nvis->buffer) {
+                ((float *) pool_nvis->data)[i] = (float) (p0 + nv);
+            }
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
             if (gm != nullptr) {

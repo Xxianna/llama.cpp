@@ -273,7 +273,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, gather_mask, gather, new_pool_idxs, new_pool_rep, ubatch);
+        mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, pool_nvis, tail_idxs, gather_mask, gather, new_pool_idxs, new_pool_rep, ubatch);
         if (reuse_sel != nullptr) {
             mctx->set_input_mtp_dsa_selection(reuse_sel, gather_mask, gather, ubatch);
         }
@@ -317,6 +317,7 @@ public:
     ggml_tensor * pool_cells    = nullptr; // I32     [n_pool]         cell caching each pool's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32     [kpool, n_pool]  member cells per pool, n_kv sentinel for the padded pools
     ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_tokens]
+    ggml_tensor * pool_nvis     = nullptr; // F32     [n_tokens]  per-token visible pool count (split-score causal mask source)
     ggml_tensor * tail_idxs     = nullptr; // I32     [kpool - 1, n_tokens]
     // split score path: first-row offset of each pool chunk (GGML_KPOOL_SPLIT_TOKENS/CTX_CHUNKS)
     ggml_tensor * chunk_offsets = nullptr;   // F32   [n_chunks]
@@ -357,7 +358,32 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, type_mask, n_pool, n_tokens);
+    // Under the split-score path the dense [n_pool x n_tokens] causal mask is replaced by a
+    // per-token visible-pool count; chunk masks are computed on GPU inside the tile loop.
+    // This eliminates the O(n_pool * n_tokens) host input (137GB at ctx=1M) and its GPU copies.
+    static const bool kpool_split_on = [] {
+        const char * e = getenv("GGML_KPOOL_SPLIT");
+        return !e || atoi(e) != 0;
+    }();
+    static const int64_t kpool_split_tokens_cfg = [] {
+        const char * e = getenv("GGML_KPOOL_SPLIT_TOKENS");
+        return e ? atoll(e) : 8192;
+    }();
+    {
+        const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
+        const int64_t chunk = [] {
+            const char * e = getenv("GGML_KPOOL_SPLIT_CHUNKS");
+            return e ? atoll(e) : 65536;
+        }();
+        // only replace the dense mask when this batch actually takes the split path
+        // (large batches); small/decode batches keep the real mask for the non-split score path
+        if (kpool_split_on && chunk > n_top_pool && n_pool > chunk && (int64_t) n_tokens > kpool_split_tokens_cfg) {
+            inp->pool_nvis  = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
+            inp->pool_mask  = ggml_new_tensor_2d(ctx0, type_mask, 1, 1); // dummy: not read by the split path
+        } else {
+            inp->pool_mask  = ggml_new_tensor_2d(ctx0, type_mask, n_pool, n_tokens);
+        }
+    }
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     // split-score chunk offsets (upper bound: one per chunk; only used when split is active)
     {
@@ -383,11 +409,17 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     ggml_set_input(inp->pool_idxs);
     ggml_set_input(inp->pool_mask);
     ggml_set_input(inp->tail_idxs);
+    if (inp->pool_nvis) {
+        ggml_set_input(inp->pool_nvis);
+    }
 
     ggml_build_forward_expand(gf, inp->pool_cells);
     ggml_build_forward_expand(gf, inp->pool_idxs);
     ggml_build_forward_expand(gf, inp->pool_mask);
     ggml_build_forward_expand(gf, inp->tail_idxs);
+    if (inp->pool_nvis) {
+        ggml_build_forward_expand(gf, inp->pool_nvis);
+    }
     if (inp->chunk_offsets) {
         ggml_build_forward_expand(gf, inp->chunk_offsets);
     }
@@ -951,7 +983,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         if (use_split) {
             auto make_score = [&](ggml_tensor * iq_t, ggml_tensor * pooled_c, ggml_tensor * weights_t, ggml_tensor * mask_t) {
                 ggml_tensor * sc = nullptr;
-                if (cparams.fused_lid) {
+                if (cparams.fused_lid && mask_t->type == GGML_TYPE_F16 && !ggml_is_view(mask_t)) {
                     sc = ggml_lightning_indexer(ctx0, iq_t, pooled_c, weights_t, mask_t);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
                 } else {
@@ -973,8 +1005,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
             const size_t n_chunk = cbegin.size();
             const size_t n_tile  = (n_tokens + kpool_split_tokens - 1) / kpool_split_tokens;
 
-            ggml_tensor * pool_mask = inp_kpool->pool_mask;
             ggml_tensor * pool_idxs = inp_kpool->pool_idxs;
+            ggml_tensor * pool_nvis = inp_kpool->pool_nvis; // F32 [n_tokens] visible pool count per token
 
             std::vector<ggml_tensor *> sel_tiles;
             for (size_t t = 0; t < n_tile; ++t) {
@@ -983,6 +1015,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 
                 auto iq_t = ggml_view_3d(ctx0, iq, iq->ne[0], iq->ne[1], tn, iq->nb[1], iq->nb[2], t0 * iq->nb[2]);
                 auto w_t  = ggml_view_2d(ctx0, weights, weights->ne[0], tn, weights->nb[1], t0 * weights->nb[1]);
+                auto nvis_t = ggml_view_1d(ctx0, pool_nvis, tn, t0 * pool_nvis->nb[0]); // [tn]
 
                 std::vector<ggml_tensor *> chunk_tp; // [n_top, tn] f32, global pool ids
                 std::vector<ggml_tensor *> chunk_ss; // [n_top, tn] f32 scores
@@ -991,8 +1024,19 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
                     const int64_t cn = (j + 1 < n_chunk ? cbegin[j + 1] : n_pool) - c0;
 
                     auto k_c = ggml_view_3d(ctx0, pooled, pooled->ne[0], 1, cn, pooled->nb[1], pooled->nb[2], c0 * pooled->nb[2]);
-                    auto m_c = ggml_view_2d(ctx0, pool_mask, cn, tn, pool_mask->nb[1],
-                            t0 * pool_mask->nb[1] + c0 * pool_mask->nb[0]);
+
+                    // Compute the chunk's causal mask on GPU from the per-token visible count:
+                    //   mask[row][col] = (c0 + row < nvis[col]) ? 0 : -large
+                    // replaces the O(n_pool * n_tokens) dense pool_mask input.
+                    ggml_tensor * rows_j = ggml_arange(ctx0, (float) c0, (float) (c0 + cn), 1.0f); // [cn]
+                    ggml_tensor * rows_2d = ggml_reshape_2d(ctx0,
+                            ggml_repeat(ctx0, rows_j, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cn, tn)), cn, tn);
+                    ggml_tensor * nvis_2d = ggml_reshape_2d(ctx0,
+                            ggml_repeat(ctx0, ggml_reshape_2d(ctx0, nvis_t, 1, tn), ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cn, tn)), cn, tn);
+                    ggml_tensor * diff = ggml_sub(ctx0, nvis_2d, rows_2d); // >0 visible, <=0 not
+                    ggml_tensor * m_c = ggml_clamp(ctx0, diff, -1e9f, 0.0f); // 0 visible, negative not
+                    // split path uses the unfused score chain: the computed mask is f32 and
+                    // the fused lightning indexer's shape assertions reject it
 
                     ggml_tensor * sc = make_score(iq_t, k_c, w_t, m_c);
                     cb(sc, "indexer_score_split", il);
