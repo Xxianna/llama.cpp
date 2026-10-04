@@ -19,6 +19,12 @@ static __global__ void dsa_mask_block_kernel(
         col[r] = drop;
     }
 
+    // the selected rows are written by different threads than the fill: without the
+    // barrier a lagging warp's drop can land after another warp's keep and mask out
+    // a live cell (an unsynchronized same-address pair, worst near the cache tail
+    // where the fill loop runs longest)
+    __syncthreads();
+
     // dump/padding rows live at r >= n_kv and are never written
     for (int i = threadIdx.x; i < n_sel; i += blockDim.x) {
         const int r = s[i];
