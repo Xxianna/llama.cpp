@@ -1133,6 +1133,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSA_MASK_BLOCK",
 
     "UNARY",
 
@@ -1150,7 +1151,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1265,7 +1266,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6513,6 +6514,26 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_dsa_mask_block
+
+struct ggml_tensor * ggml_dsa_mask_block(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sel,
+        int64_t               n_kv,
+        enum ggml_type        type) {
+
+    GGML_ASSERT(sel->type == GGML_TYPE_I32);
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(sel->ne[2] == 1 && sel->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, type, n_kv, sel->ne[1]);
+
+    result->op     = GGML_OP_DSA_MASK_BLOCK;
+    result->src[0] = sel;
 
     return result;
 }

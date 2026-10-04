@@ -12433,3 +12433,51 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_dsa_mask_block
+
+void ggml_compute_forward_dsa_mask_block(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * sel = dst->src[0];
+
+    GGML_ASSERT(sel->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
+
+    const int64_t n_kv  = dst->ne[0];
+    const int64_t n_tok = dst->ne[1];
+    const int64_t n_sel = sel->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // f16 saturates -1e9f to -inf, matching the clamp/cast chain this op replaces
+    for (int64_t t = ith; t < n_tok; t += nth) {
+        const int32_t * s = (const int32_t *) ((const char *) sel->data + t*sel->nb[1]);
+
+        if (dst->type == GGML_TYPE_F16) {
+            ggml_fp16_t * row = (ggml_fp16_t *) ((char *) dst->data + t*dst->nb[1]);
+
+            for (int64_t r = 0; r < n_kv; ++r) {
+                row[r] = GGML_CPU_FP32_TO_FP16(-1e9f);
+            }
+            for (int64_t i = 0; i < n_sel; ++i) {
+                if (s[i] >= 0 && s[i] < n_kv) {
+                    row[s[i]] = GGML_CPU_FP32_TO_FP16(0.0f);
+                }
+            }
+        } else {
+            float * row = (float *) ((char *) dst->data + t*dst->nb[1]);
+
+            for (int64_t r = 0; r < n_kv; ++r) {
+                row[r] = -INFINITY;
+            }
+            for (int64_t i = 0; i < n_sel; ++i) {
+                if (s[i] >= 0 && s[i] < n_kv) {
+                    row[s[i]] = 0.0f;
+                }
+            }
+        }
+    }
+}

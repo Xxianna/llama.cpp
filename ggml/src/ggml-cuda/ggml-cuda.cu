@@ -74,6 +74,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/dsa-mask-block.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2465,6 +2466,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_DSA_MASK_BLOCK:
+            ggml_cuda_dsa_mask_block(ctx, dst);
             break;
         default:
             return false;
@@ -5785,6 +5789,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_DSA_MASK_BLOCK:
+            return true;
 
         default:
             return false;

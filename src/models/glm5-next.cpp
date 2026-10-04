@@ -367,17 +367,27 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     }();
     static const int64_t kpool_split_tokens_cfg = [] {
         const char * e = getenv("GGML_KPOOL_SPLIT_TOKENS");
+        return e ? atoll(e) : 2048;
+    }();
+    static const int64_t kpool_split_chunks_cfg = [] {
+        const char * e = getenv("GGML_KPOOL_SPLIT_CHUNKS");
         return e ? atoll(e) : 8192;
     }();
+    // split when the monolithic [n_pool x n_tokens] score would be large; keeps decode
+    // (n_tokens ~ 1) and small-context batches on the monolithic path with its real mask
+    static const int64_t kpool_split_prod_min = [] {
+        const char * e = getenv("GGML_KPOOL_SPLIT_PROD_MIN");
+        return e ? atoll(e) : (int64_t) 1 << 24;
+    }();
+    const auto kpool_use_split = [&](int64_t n_pool_cur) {
+        const int64_t n_top_pool = std::min<int64_t>(n_pool_cur, hparams.indexer_top_k / kpool);
+        return kpool_split_on && kpool_split_tokens_cfg > 0 && kpool_split_chunks_cfg > n_top_pool &&
+            n_pool_cur > kpool_split_chunks_cfg && n_pool_cur * (int64_t) n_tokens > kpool_split_prod_min;
+    };
     {
-        const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
-        const int64_t chunk = [] {
-            const char * e = getenv("GGML_KPOOL_SPLIT_CHUNKS");
-            return e ? atoll(e) : 65536;
-        }();
-        // only replace the dense mask when this batch actually takes the split path
-        // (large batches); small/decode batches keep the real mask for the non-split score path
-        if (kpool_split_on && chunk > n_top_pool && n_pool > chunk && (int64_t) n_tokens > kpool_split_tokens_cfg) {
+        // only replace the dense mask when this batch actually takes the split path;
+        // small/decode batches keep the real mask for the non-split score path
+        if (kpool_use_split(n_pool)) {
             inp->pool_nvis  = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_tokens);
             inp->pool_mask  = ggml_new_tensor_2d(ctx0, type_mask, 1, 1); // dummy: not read by the split path
         } else {
@@ -387,15 +397,11 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     // split-score chunk offsets (upper bound: one per chunk; only used when split is active)
     {
-        const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
-        const int64_t chunk = [] {
-            const char * e = getenv("GGML_KPOOL_SPLIT_CHUNKS");
-            return e ? atoll(e) : 65536;
-        }();
-        if (chunk > n_top_pool && n_pool > chunk) {
+        const int64_t chunk = kpool_split_chunks_cfg;
+        if (chunk > (int64_t) std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool) && n_pool > chunk) {
             for (int64_t c = 0; c < n_pool; ) {
                 int64_t cn = std::min<int64_t>(chunk, n_pool - c);
-                if (n_pool - (c + cn) > 0 && n_pool - (c + cn) < n_top_pool) {
+                if (n_pool - (c + cn) > 0 && n_pool - (c + cn) < (int64_t) std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool)) {
                     cn = n_pool - c;
                 }
                 inp->chunk_bounds.push_back(c);
@@ -978,16 +984,22 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         }();
         static const int kpool_split_chunks = [] {
             const char * e = getenv("GGML_KPOOL_SPLIT_CHUNKS");
-            return e ? atoi(e) : 65536;
+            return e ? atoi(e) : 8192;
         }();
         static const bool kpool_split_on = [] {
             const char * e = getenv("GGML_KPOOL_SPLIT");
             return !e || atoi(e) != 0;
         }();
+        static const int64_t kpool_split_prod_min = [] {
+            const char * e = getenv("GGML_KPOOL_SPLIT_PROD_MIN");
+            return e ? atoll(e) : (int64_t) 1 << 24;
+        }();
 
         const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
+        // must match build_inp_kpool's kpool_use_split for the same ubatch; the product bound
+        // keeps decode (n_tokens ~ 1) and small-context batches on the monolithic path
         const bool use_split = kpool_split_on && kpool_split_tokens > 0 &&
-            !inp_kpool->chunk_bounds.empty() && n_tokens > kpool_split_tokens;
+            !inp_kpool->chunk_bounds.empty() && n_pool * n_tokens > kpool_split_prod_min;
 
         if (use_split) {
             // per-tile indexer query: [n_embd_indexer, n_head, tn], computed from the qr tile
@@ -1306,20 +1318,20 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
         // Tiled scatter attention. Equivalence to the monolithic scatter path is
         // structural, per token column t:
-        //  1. causal block  base[r][t] = (r < nvis[t]) ? 0 : -inf  is value-identical to
-        //     the dense kq_mask row for single-sequence 1d batches: the kept cells
-        //     (non-empty, same seq, pos <= pos_t) are exactly the prefix [0, nvis[t])
-        //     of the stream's cell range, and clamp(-1e9, 0) cast to F16 saturates to
-        //     -inf exactly like the dense input's mask_drop.
-        //  2. the set_rows zero-unmasking is the monolithic op applied to the column
-        //     slice [tb, tb+tn) of the same dump-mapped sel_idx tensor.
-        //  3. flash_attn_ext over the same K/V cache rows with the same additive mask
+        //  1. the fused mask block (ggml_dsa_mask_block) writes 0 exactly at the live
+        //     selected cells of the dump-mapped sel_idx column slice and the drop value
+        //     elsewhere -- value-identical to the monolithic set_rows(-inf canvas, zeros)
+        //     for this slice, because every live selection is causally visible (the
+        //     -1e9 pool-mask penalty keeps invisible pools out of the top-k), so the
+        //     causal base the old chain added was 0 exactly at the kept rows.
+        //  2. flash_attn_ext over the same K/V cache rows with the same additive mask
         //     column computes the same per-token softmax (softmax never crosses query
         //     rows); the sparse FA variant compacts identical mask values into
         //     identical index sets.
-        //  4. wo applied per tile is a column split of the monolithic wo mul_mat.
+        //  3. wo applied per tile is a column split of the monolithic wo mul_mat.
         // Peak memory drops from [n_kv x n_tokens] mask tensors (137 GiB at
-        // ctx=1M x batch=65536, impossible to reserve) to [n_kv x tile] blocks.
+        // ctx=1M x batch=65536, impossible to reserve) to [n_kv x tile] blocks,
+        // each a single tensor instead of a chain of same-shape intermediates.
         {
             // dummy the dense mask input exactly like the gather path: set_input
             // writes one element harmlessly, the reserve never sees [n_kv x n_tokens]
@@ -1333,17 +1345,6 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
         const int64_t n_kv_attn = mctx_mla->get_n_kv();
         const int64_t n_sel = sel->ne[0];
-        ggml_tensor * nvis = inp_attn->get_kq_nvis();
-        GGML_ASSERT(nvis != nullptr && nvis->ne[0] == n_tokens);
-
-        // seed tensors for the per-tile fills (fill overwrites the value)
-        ggml_tensor * seed_inf = ggml_cast(ctx0, ggml_view_1d(ctx0, sel, 1, 0), GGML_TYPE_F32);
-        ggml_tensor * mask_seed = kq_mask->type == GGML_TYPE_F32 ? seed_inf : ggml_cast(ctx0, seed_inf, kq_mask->type);
-        mask_seed = ggml_fill(ctx0, mask_seed, -INFINITY);
-        ggml_tensor * zero_seed = ggml_fill(ctx0, seed_inf, 0.0f);
-
-        // causal row index [n_kv]: shared by all tiles
-        ggml_tensor * rows = ggml_arange(ctx0, 0.0f, (float) n_kv_attn, 1.0f); // [n_kv]
 
         ggml_tensor * k = mctx_mla->get_k(ctx0, il);
         ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
@@ -1362,26 +1363,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             q_t = ggml_permute(ctx0, q_t, 0, 2, 1, 3); // [kv_lora, n_head, tn]
             cb(q_t, "q_absorbed_tile", il);
 
-            // causal base block [n_kv, tn] F16
-            ggml_tensor * rows_2d = ggml_reshape_2d(ctx0,
-                    ggml_repeat(ctx0, rows, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_attn, tn)), n_kv_attn, tn);
-            auto nvis_t  = ggml_view_1d(ctx0, nvis, tn, tb * nvis->nb[0]);
-            ggml_tensor * nvis_2d = ggml_reshape_2d(ctx0,
-                    ggml_repeat(ctx0, ggml_reshape_2d(ctx0, nvis_t, 1, tn), ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_attn, tn)), n_kv_attn, tn);
-            ggml_tensor * base = ggml_clamp(ctx0, ggml_sub(ctx0, nvis_2d, rows_2d), -1e9f, 0.0f);
-            base = ggml_cast(ctx0, base, kq_mask->type);
-            cb(base, "kq_mask_causal_tile", il);
-
-            // selection unmasking: the monolithic set_rows on the column slice
-            ggml_tensor * canvas = ggml_repeat_4d(ctx0, mask_seed, 1, n_kv_attn + n_sel, tn, 1);
-            canvas = ggml_reshape_3d(ctx0, canvas, 1, n_kv_attn + n_sel, tn);
-            ggml_tensor * zeros_t = ggml_repeat_4d(ctx0, zero_seed, 1, n_sel, tn, 1);
-            zeros_t = ggml_reshape_3d(ctx0, zeros_t, 1, n_sel, tn);
+            // fused mask block [n_kv, tn]: 0 at the live selected cells, drop elsewhere.
+            // Value-equivalent to the repeat/sub/clamp/cast + fill/set_rows/add chain it
+            // replaces (single-sequence 1d: live selections are always within the causal
+            // prefix, so the causal base is 0 exactly there); one [n_kv x tn] tensor
+            // instead of ~6 F32/F16 intermediates of the same shape.
             auto idx_t = ggml_view_2d(ctx0, sel, n_sel, tn, sel->nb[1], tb * sel->nb[1]);
-            ggml_tensor * sel_t = ggml_set_rows(ctx0, canvas, zeros_t, ggml_reshape_3d(ctx0, idx_t, n_sel, tn, 1));
-            sel_t = ggml_view_2d(ctx0, sel_t, n_kv_attn, tn, sel_t->nb[2], 0);
-
-            ggml_tensor * mask_t = ggml_add(ctx0, sel_t, base);
+            ggml_tensor * mask_t = ggml_dsa_mask_block(ctx0, idx_t, n_kv_attn, kq_mask->type);
             cb(mask_t, "kq_mask_dsa_tile", il);
 
             ggml_tensor * out_t = build_attn_mha(q_t, k, v, nullptr, mask_t, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);

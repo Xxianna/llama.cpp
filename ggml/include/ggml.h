@@ -600,6 +600,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSA_MASK_BLOCK,
 
         GGML_OP_UNARY,
 
@@ -2691,6 +2692,18 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // GLM DSA sparse-attention mask block, the fused form of the tiled scatter
+    // mask chain (see glm5-next build_dsa_layer):
+    //   sel: [n_sel, n_tokens] i32, dump-mapped cell indices; values outside [0, n_kv) are never written
+    //   res: [n_kv, n_tokens], 0.0 at the live selected rows, drop elsewhere
+    //        (f16: -inf via saturating conversion, f32: -1e9 -- identical values
+    //        to the clamp/cast/set_rows chain it replaces)
+    GGML_API struct ggml_tensor * ggml_dsa_mask_block(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sel,
+            int64_t               n_kv,
+            enum ggml_type        type);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
