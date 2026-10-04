@@ -1054,16 +1054,23 @@ void launch_fattn(
         }();
         const int64_t k_ne = ggml_nelements(K);
         if (!k16_cache_off && ggml_is_contiguously_allocated(K) && k_ne >= (int64_t) 1 << 24) {
+            // size the buffer for the WHOLE cache so the pointer never moves: CUDA
+            // graphs bake this pointer into captured instances, and a mid-life
+            // cudaFree+cudaMalloc leaves props-identical replays writing/reading
+            // freed memory (cross-request staleness on a persistent server)
+            const ggml_tensor * k_store = K->view_src ? K->view_src : K;
+            const size_t cap_need = (size_t) ggml_nelements(k_store)*sizeof(half);
             const size_t need = k_ne*sizeof(half);
-            if (ctx.fattn_kv16_cap < need) {
+            if (ctx.fattn_kv16_cap < cap_need) {
+                size_t alloc_size = std::max(cap_need, need);
                 if (getenv("GGML_K16_DEBUG")) {
-                    fprintf(stderr, "k16: realloc cap=%zu -> need=%zu ptr=%p\n", ctx.fattn_kv16_cap, need, ctx.fattn_kv16_ptr);
+                    fprintf(stderr, "k16: alloc cap=%zu (full store) need=%zu ptr=%p\n", alloc_size, need, ctx.fattn_kv16_ptr);
                 }
                 if (ctx.fattn_kv16_ptr != nullptr) {
                     CUDA_CHECK(cudaFree(ctx.fattn_kv16_ptr));
                 }
-                CUDA_CHECK(cudaMalloc(&ctx.fattn_kv16_ptr, need));
-                ctx.fattn_kv16_cap = need;
+                CUDA_CHECK(cudaMalloc(&ctx.fattn_kv16_ptr, alloc_size));
+                ctx.fattn_kv16_cap = alloc_size;
                 ctx.fattn_kv16_src = nullptr; // force reconvert after realloc
             }
             if (ctx.fattn_kv16_src != (const void *) K_data || ctx.fattn_kv16_ne != k_ne) {
