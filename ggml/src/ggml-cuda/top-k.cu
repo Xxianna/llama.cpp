@@ -229,9 +229,18 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
     // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k
-    // DeviceTopK rejects some large-row launches with cudaErrorInvalidValue at the second
-    // 65536-token ubatch (top_k_cub line 35); take the argsort path for big row counts.
-    if (nrows <= 4096) {
+    // DeviceTopK::MaxPairs (per-row loop) races with itself on CCCL < 3.4.3 (fixed upstream,
+    // needs the newer library): with not-guaranteed determinism it uses internal auxiliary
+    // streams, so back-to-back calls reuse the same pool temp storage unordered. Observed as
+    // silently wrong indices at k=512/ncols>=2048 (selection corruption -> garbage text) and
+    // out-of-range indices at larger sizes (get_rows IMA). Default to the argsort+copy path
+    // (one segmented sort per call, upstream's original, race-free); GGML_TOPK_DEVICE_TOPK=1
+    // opts back in for CCCL >= 3.4.3.
+    static const bool allow_device_topk = [] {
+        const char * e = getenv("GGML_TOPK_DEVICE_TOPK");
+        return e && atoi(e) != 0 && CCCL_VERSION >= 3004003;
+    }();
+    if (nrows <= 4096 && allow_device_topk) {
         for (int i = 0; i < nrows; i++) {
             top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
         }
