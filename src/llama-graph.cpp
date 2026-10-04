@@ -67,14 +67,13 @@ static ggml_tensor * build_attn_inp_kq_mask(
     }();
     const bool scatter_tiled = scatter_tile_cfg > 0 && !dsa_gather_prefill
         && (int64_t) n_tokens > scatter_tile_cfg && ubatch.n_seqs == 1 && !ubatch.is_pos_2d();
-    // only create the dummy for batches large enough to take a path that never reads
-    // the dense mask; smaller batches may still take the scatter path (e.g. when
-    // n_kv < n_sel early in the context) and need the real mask
-    static const int64_t dummy_threshold = [] {
-        const char * e = getenv("GGML_KPOOL_SPLIT_TOKENS");
-        return e ? atoll(e) : 8192;
-    }();
-    if ((dsa_gather_prefill || scatter_tiled) && (int64_t) n_tokens > dummy_threshold) {
+    // only create the dummy when the batch takes a path that never reads the dense mask;
+    // scatter_tiled batches of ANY size build fused [n_kv x tile] blocks instead, and the
+    // gather path swaps in its own dummy (it can trigger even when scatter_tiled is true
+    // here, early in the context where n_kv <= n_sel -- the swap makes this dummy moot).
+    // The remaining consumers (monolithic scatter: small/2d/multi-seq batches) are bounded
+    // by the scatter tile size.
+    if (dsa_gather_prefill || scatter_tiled) {
         ggml_tensor * res = ggml_new_tensor_1d(ctx, type, 1);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_kq_mask");

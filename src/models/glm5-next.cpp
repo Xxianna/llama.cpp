@@ -395,9 +395,20 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         }
     }
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
-    // split-score chunk offsets (upper bound: one per chunk; only used when split is active)
+    // split-score chunk offsets (upper bound: one per chunk; only used when split is active).
+    // Cap the chunk count: the fit graph projects n_pool to the full context (262144 at 1M),
+    // and per-(chunk x tile) score blocks multiply into tens of thousands of graph nodes
+    // whose reserve degrades badly; <= 8 chunks keeps every plan bounded (per-chunk tensors
+    // grow to n_pool/8 instead).
+    static const int64_t kpool_split_max_chunks = [] {
+        const char * e = getenv("GGML_KPOOL_SPLIT_MAX_CHUNKS");
+        return e ? atoll(e) : 8;
+    }();
     {
-        const int64_t chunk = kpool_split_chunks_cfg;
+        int64_t chunk = kpool_split_chunks_cfg;
+        if (n_pool > chunk && kpool_split_max_chunks > 0) {
+            chunk = std::max<int64_t>(chunk, (n_pool + kpool_split_max_chunks - 1) / kpool_split_max_chunks);
+        }
         if (chunk > (int64_t) std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool) && n_pool > chunk) {
             for (int64_t c = 0; c < n_pool; ) {
                 int64_t cn = std::min<int64_t>(chunk, n_pool - c);
@@ -1060,15 +1071,29 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
                     auto k_c = ggml_view_3d(ctx0, pooled, pooled->ne[0], 1, cn, pooled->nb[1], pooled->nb[2], c0 * pooled->nb[2]);
 
                     // Compute the chunk's causal mask on GPU from the per-token visible count:
-                    //   mask[row][col] = (c0 + row < nvis[col]) ? 0 : -large
-                    // replaces the O(n_pool * n_tokens) dense pool_mask input.
+                    //   mask[row][col] = (c0 + row < nvis[col]) ? 0 : -1e9
+                    // replaces the O(n_pool * n_tokens) dense pool_mask input. The step must be
+                    // exact: the monolithic dense mask is -inf for every row >= nvis, INCLUDING
+                    // the frontier row == nvis (the pool containing the query position -- its
+                    // past members are covered by the tail, and selecting it would attend the
+                    // pool's future members, i.e. unwritten cache rows). clamp(diff, -1e9, 0)
+                    // leaves that row at 0 and near-future rows at -1, -2, ... -- a ramp that
+                    // local high-scoring future pools can beat, leaking future cells into the
+                    // selection. With integer-valued diff, 1-diff clamped to [0,1] is exactly
+                    // the invisible indicator including the boundary.
                     ggml_tensor * rows_j = ggml_arange(ctx0, (float) c0, (float) (c0 + cn), 1.0f); // [cn]
                     ggml_tensor * rows_2d = ggml_reshape_2d(ctx0,
                             ggml_repeat(ctx0, rows_j, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cn, tn)), cn, tn);
                     ggml_tensor * nvis_2d = ggml_reshape_2d(ctx0,
                             ggml_repeat(ctx0, ggml_reshape_2d(ctx0, nvis_t, 1, tn), ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cn, tn)), cn, tn);
-                    ggml_tensor * diff = ggml_sub(ctx0, nvis_2d, rows_2d); // >0 visible, <=0 not
-                    ggml_tensor * m_c = ggml_clamp(ctx0, diff, -1e9f, 0.0f); // 0 visible, negative not
+                    ggml_tensor * diff = ggml_sub(ctx0, nvis_2d, rows_2d); // >=1 visible, <=0 not
+                    // the ones constant is derived from rows_2d (an existing tensor clamped to
+                    // a fixed value); ggml_new_tensor + ggml_fill would instead create a graph
+                    // LEAF the allocator never frees -- at the fit graph's chunk x tile counts
+                    // that measured as a 740 GiB reserve blowup
+                    ggml_tensor * ones = ggml_clamp(ctx0, rows_2d, 1.0f, 1.0f);
+                    ggml_tensor * m_c = ggml_scale(ctx0,
+                            ggml_clamp(ctx0, ggml_sub(ctx0, ones, diff), 0.0f, 1.0f), -1e9f); // 0 visible, -1e9 invisible
                     // split path uses the unfused score chain: the computed mask is f32 and
                     // the fused lightning indexer's shape assertions reject it
 
@@ -1088,24 +1113,35 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
                     chunk_ss.push_back(ggml_reshape_2d(ctx0, ss, n_top_pool, tn));
                 }
 
-                // merge: top-k over the concatenated per-chunk candidates
-                ggml_tensor * tp_cat = ggml_cast(ctx0, chunk_tp[0], GGML_TYPE_F32);
-                for (size_t j = 1; j < n_chunk; ++j) {
-                    tp_cat = ggml_concat(ctx0, tp_cat, ggml_cast(ctx0, chunk_tp[j], GGML_TYPE_F32), 0);
-                }
-                ggml_tensor * ss_cat = chunk_ss[0];
-                for (size_t j = 1; j < n_chunk; ++j) {
-                    ss_cat = ggml_concat(ctx0, ss_cat, chunk_ss[j], 0);
-                }
+                // merge: running top-k over the per-chunk candidates. Concatenating every
+                // chunk's candidates first (the original form) builds O(n_chunk^2) live
+                // bytes per tile through the pairwise-concat chains -- at the fit graph's
+                // projected n_pool (262144 = 32 chunks) that alone was ~776 GiB of plan.
+                // top-k(prev best, chunk j) is exactly top-k of the union (selection
+                // commutes), each step is [2*n_top, tn] and the intermediates rotate.
+                auto merge_top_k = [&](ggml_tensor * tp_cat, ggml_tensor * ss_cat) {
+                    // tp_cat/ss_cat: [m >= n_top, tn] f32, global pool ids and their scores
+                    ggml_tensor * tk = ggml_top_k(ctx0, ss_cat, n_top_pool); // unordered
+                    ggml_tensor * sel_score = ggml_get_rows(ctx0,
+                            ggml_reshape_3d(ctx0, ss_cat, 1, tp_cat->ne[0], tn), tk);
+                    ggml_tensor * sel_order = ggml_argsort(ctx0,
+                            ggml_reshape_2d(ctx0, sel_score, n_top_pool, tn), GGML_SORT_ORDER_DESC);
+                    ggml_tensor * tp = ggml_get_rows(ctx0,
+                            ggml_reshape_3d(ctx0, tp_cat, 1, tp_cat->ne[0], tn), sel_order);
+                    return std::make_pair(ggml_reshape_2d(ctx0, tp, n_top_pool, tn),
+                                          ggml_reshape_2d(ctx0, sel_score, n_top_pool, tn));
+                };
 
-                ggml_tensor * top_k = ggml_top_k(ctx0, ss_cat, n_top_pool); // unordered
-                ggml_tensor * sel_score = ggml_get_rows(ctx0,
-                        ggml_reshape_3d(ctx0, ss_cat, 1, n_chunk * n_top_pool, tn), top_k);
-                ggml_tensor * sel_order = ggml_argsort(ctx0,
-                        ggml_reshape_2d(ctx0, sel_score, n_top_pool, tn), GGML_SORT_ORDER_DESC);
-                top_k = ggml_get_rows(ctx0,
-                        ggml_reshape_3d(ctx0, tp_cat, 1, n_chunk * n_top_pool, tn), sel_order);
-                top_k = ggml_cast(ctx0, ggml_cont(ctx0, ggml_reshape_2d(ctx0, top_k, n_top_pool, tn)), GGML_TYPE_I32);
+                ggml_tensor * tp_run = ggml_cast(ctx0, chunk_tp[0], GGML_TYPE_F32);
+                ggml_tensor * ss_run = chunk_ss[0];
+                for (size_t j = 1; j < n_chunk; ++j) {
+                    ggml_tensor * cand_tp = ggml_concat(ctx0, tp_run, ggml_cast(ctx0, chunk_tp[j], GGML_TYPE_F32), 0);
+                    ggml_tensor * cand_ss = ggml_concat(ctx0, ss_run, chunk_ss[j], 0);
+                    auto best = merge_top_k(cand_tp, cand_ss);
+                    tp_run = best.first;
+                    ss_run = best.second;
+                }
+                ggml_tensor * top_k = ggml_cast(ctx0, ggml_cont(ctx0, tp_run), GGML_TYPE_I32);
                 cb(top_k, "indexer_top_k", il);
 
                 ggml_tensor * sel_t = ggml_get_rows(ctx0, pool_idxs,
