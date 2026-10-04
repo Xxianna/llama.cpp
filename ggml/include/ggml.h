@@ -2702,6 +2702,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_dsa_mask_block(
             struct ggml_context * ctx,
             struct ggml_tensor  * sel,
+            struct ggml_tensor  * nvis,   // F32 [n_tokens] visible cell count; debug invariant only
             int64_t               n_kv,
             enum ggml_type        type);
 

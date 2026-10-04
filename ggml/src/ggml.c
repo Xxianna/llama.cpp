@@ -6523,17 +6523,20 @@ struct ggml_tensor * ggml_lightning_indexer(
 struct ggml_tensor * ggml_dsa_mask_block(
         struct ggml_context * ctx,
         struct ggml_tensor  * sel,
+        struct ggml_tensor  * nvis,
         int64_t               n_kv,
         enum ggml_type        type) {
 
     GGML_ASSERT(sel->type == GGML_TYPE_I32);
     GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
     GGML_ASSERT(sel->ne[2] == 1 && sel->ne[3] == 1);
+    GGML_ASSERT(nvis == NULL || (nvis->type == GGML_TYPE_F32 && nvis->ne[0] == sel->ne[1]));
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, type, n_kv, sel->ne[1]);
 
     result->op     = GGML_OP_DSA_MASK_BLOCK;
     result->src[0] = sel;
+    result->src[1] = nvis;
 
     return result;
 }

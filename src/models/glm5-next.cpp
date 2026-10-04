@@ -1381,6 +1381,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
         const int64_t n_kv_attn = mctx_mla->get_n_kv();
         const int64_t n_sel = sel->ne[0];
+        ggml_tensor * nvis = inp_attn->get_kq_nvis(); // debug invariant source (GGML_DSA_SEL_DUMP)
 
         ggml_tensor * k = mctx_mla->get_k(ctx0, il);
         ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
@@ -1405,7 +1406,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             // prefix, so the causal base is 0 exactly there); one [n_kv x tn] tensor
             // instead of ~6 F32/F16 intermediates of the same shape.
             auto idx_t = ggml_view_2d(ctx0, sel, n_sel, tn, sel->nb[1], tb * sel->nb[1]);
-            ggml_tensor * mask_t = ggml_dsa_mask_block(ctx0, idx_t, n_kv_attn, kq_mask->type);
+            auto nvis_t = ggml_view_1d(ctx0, nvis, tn, tb * nvis->nb[0]);
+            ggml_tensor * mask_t = ggml_dsa_mask_block(ctx0, idx_t, nvis_t, n_kv_attn, kq_mask->type);
             cb(mask_t, "kq_mask_dsa_tile", il);
 
             ggml_tensor * out_t = build_attn_mha(q_t, k, v, nullptr, mask_t, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
