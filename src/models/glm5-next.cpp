@@ -1406,8 +1406,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             // prefix, so the causal base is 0 exactly there); one [n_kv x tn] tensor
             // instead of ~6 F32/F16 intermediates of the same shape.
             auto idx_t = ggml_view_2d(ctx0, sel, n_sel, tn, sel->nb[1], tb * sel->nb[1]);
-            auto nvis_t = ggml_view_1d(ctx0, nvis, tn, tb * nvis->nb[0]);
-            ggml_tensor * mask_t = ggml_dsa_mask_block(ctx0, idx_t, nvis_t, n_kv_attn, kq_mask->type);
+            // pass the nvis INPUT BASE (views of inputs ride a fragile copy path); the tile
+            // offset travels in op params
+            ggml_tensor * mask_t = ggml_dsa_mask_block(ctx0, idx_t, nvis, tb, n_kv_attn, kq_mask->type);
             cb(mask_t, "kq_mask_dsa_tile", il);
 
             ggml_tensor * out_t = build_attn_mha(q_t, k, v, nullptr, mask_t, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);

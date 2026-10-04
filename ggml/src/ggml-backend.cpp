@@ -877,6 +877,13 @@ struct ggml_backend_sched {
     bool prefetch_used[GGML_SCHED_MAX_PREFETCH_SLOTS];
     std::vector<ggml_tensor *> weights_full_copied; // multi-consumer mm_id weights already fully copied this graph
     std::vector<std::pair<ggml_tensor *, int>> mmid_n_consumers; // graph-wide MUL_MAT_ID consumers per weights copy
+    // pass-5 rebinds node->src[j] to the split's input copy IN PLACE. When the same
+    // graph is split again (decode reuse, reserve re-plan) after sched_reset cleared
+    // the copy registry, that stale copy hashes as an already-local tensor, is never
+    // registered as a split input, and its bytes are never refilled (zeros/stale, or
+    // an illegal access with the multi-copy ring). This map remembers copy -> original
+    // so a re-split can restore the user's graph before processing.
+    std::unordered_map<ggml_tensor *, ggml_tensor *> input_copy_orig;
     int prefetch_cur;
 
     char * context_buffer;
@@ -1460,6 +1467,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 continue;
             }
 
+            // undo rebinds left by a previous split of this same graph (see input_copy_orig):
+            // every src read below must see the user's original tensor, and the stale copy
+            // would otherwise be treated as already-local and never refilled
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (node->src[j] == NULL) {
+                    continue;
+                }
+                auto orig_it = sched->input_copy_orig.find(node->src[j]);
+                if (orig_it != sched->input_copy_orig.end()) {
+                    node->src[j] = orig_it->second;
+                }
+            }
+
             const int node_backend_id = tensor_backend_id(node);
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
@@ -1547,11 +1567,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                            // a view of a user input carries the data semantics of an input (the
+                            // host bytes under the view are refilled every graph): without the flag
+                            // its copy takes the generic non-input path, whose source pointer
+                            // depends on the view surviving the allocation graph's view_init --
+                            // silent zeros when it does not
+                            if (src->flags & GGML_TENSOR_FLAG_INPUT) {
+                                ggml_set_input(tensor_copy);
+                            }
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
+                            sched->input_copy_orig[tensor_copy] = src;
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
                         int n_inputs = split->n_inputs++;
@@ -2713,6 +2742,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
 
+    // the struct is calloc'd: non-trivial C++ members must be constructed in place
+    // (a zeroed std::unordered_map SIGFPEs on first use; the std::vector members above
+    // only survive zeroing by libstdc++'s null-empty layout accident)
+    new (&sched->input_copy_orig) decltype(sched->input_copy_orig)();
+
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
 
@@ -2834,6 +2868,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
+    sched->input_copy_orig.~unordered_map();
     free(sched);
 }
 

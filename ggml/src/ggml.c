@@ -6524,6 +6524,7 @@ struct ggml_tensor * ggml_dsa_mask_block(
         struct ggml_context * ctx,
         struct ggml_tensor  * sel,
         struct ggml_tensor  * nvis,
+        int64_t               nvis_off,
         int64_t               n_kv,
         enum ggml_type        type) {
 
@@ -6537,6 +6538,8 @@ struct ggml_tensor * ggml_dsa_mask_block(
     result->op     = GGML_OP_DSA_MASK_BLOCK;
     result->src[0] = sel;
     result->src[1] = nvis;
+
+    ggml_set_op_params_i32(result, 0, (int32_t) nvis_off);
 
     return result;
 }

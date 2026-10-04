@@ -38,11 +38,11 @@ static __global__ void dsa_mask_block_kernel(
 // i.e. every non-dump row must be < nvis[t]. Prints one line per token column from
 // block 0 and a violation line from any block that sees a leak.
 static __global__ void dsa_mask_block_check_kernel(
-        const int * __restrict__ sel, const float * __restrict__ nvis,
+        const int * __restrict__ sel, const float * __restrict__ nvis, const int nvis_off,
         const int n_kv, const int n_sel, const size_t sel_nb1) {
     const int t = blockIdx.x;
     const int * __restrict__ s = (const int *) ((const char *) sel + (size_t) t*sel_nb1);
-    const int nv = (int) nvis[t];
+    const int nv = (int) nvis[t + nvis_off];
 
     int leak = 0, neg = 0, dump = 0, mn = 1 << 30, mx = -1;
     for (int i = threadIdx.x; i < n_sel; i += blockDim.x) {
@@ -95,6 +95,8 @@ static void dsa_mask_block_f16(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                 (const int *) sel->data, (float *) dst->data, n_kv, n_sel, sel->nb[1], -INFINITY, 0.0f);
     }
 
+    const int nvis_off = nvis != nullptr ? ggml_get_op_params_i32(dst, 0) : 0;
+
     static const bool sel_dump = [] {
         const char * e = getenv("GGML_DSA_SEL_DUMP");
         return e && atoi(e) != 0;
@@ -120,7 +122,7 @@ static void dsa_mask_block_f16(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     }
     if (sel_dump && nvis != nullptr && nvis->buffer != nullptr) {
         dsa_mask_block_check_kernel<<<blocks_num, block_dim, 0, stream>>>(
-                (const int *) sel->data, (const float *) nvis->data, n_kv, n_sel, sel->nb[1]);
+                (const int *) sel->data, (const float *) nvis->data, nvis_off, n_kv, n_sel, sel->nb[1]);
     }
     CUDA_CHECK(cudaGetLastError());
 }
