@@ -1163,6 +1163,25 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         return sel_idx;
     }
 
+    // Tiled scatter (GGML_DSA_SCATTER_TILE, see build_dsa_layer): return the dump-mapped
+    // cell indices; the per-token mask blocks are built per tile by the caller. The dump
+    // mapping below is the exact computation the monolithic path performs before its
+    // set_rows, so both paths consume identical sel_idx values.
+    static const bool scatter_tiled = [] {
+        const char * e = getenv("GGML_DSA_SCATTER_TILE");
+        return e ? atoll(e) > 0 : true;
+    }();
+    if (scatter_tiled) {
+        ggml_tensor * seed_r = ggml_cast(ctx0, ggml_view_1d(ctx0, sel_idx, 1, 0), GGML_TYPE_F32);
+        ggml_tensor * live_r  = ggml_exp(ctx0, ggml_reshape_2d(ctx0, inp_kpool->gather_mask, n_sel, n_tokens));
+        ggml_tensor * dump_r  = ggml_arange(ctx0, (float) n_kv, (float) (n_kv + n_sel), 1.0f);
+        ggml_tensor * idx_r   = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
+        idx_r = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_r, dump_r), live_r), dump_r);
+        idx_r = ggml_cast(ctx0, idx_r, GGML_TYPE_I32);
+        cb(idx_r, "indexer_sel_idx_mapped", il);
+        return idx_r;
+    }
+
     // Tie scatter storage lifetime to this layer's selected indices.
     ggml_tensor * seed = ggml_cast(ctx0, ggml_view_1d(ctx0, sel_idx, 1, 0), GGML_TYPE_F32);
 
@@ -1220,11 +1239,21 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
     cb(kv_cmpr, "kv_cmpr", il);
 
+    // Tiled scatter (env GGML_DSA_SCATTER_TILE, tile size = its value, 0 = monolithic).
+    // Applies to single-sequence 1d-position batches only; multi-slot decode and 2d-rope
+    // vision batches take the monolithic scatter below unchanged.
+    static const int64_t scatter_tile_sz = [] {
+        const char * e = getenv("GGML_DSA_SCATTER_TILE");
+        return e ? atoll(e) : 1024;
+    }();
+    const bool scatter_tiled = !inp_kpool->gather && scatter_tile_sz > 0
+        && n_tokens > scatter_tile_sz && ubatch.n_seqs == 1 && !ubatch.is_pos_2d();
+
     // absorb wk_b so the cache holds only the latent.
     // the gather path computes q_absorbed per tile (the full tensor is 8+ GiB at 65536 tokens);
     // only the scatter path materializes it
     ggml_tensor * q_absorbed = nullptr;
-    if (!inp_kpool->gather) {
+    if (!inp_kpool->gather && !scatter_tiled) {
         ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
         q = ggml_reshape_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens);
 
@@ -1253,6 +1282,103 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, kv_cmpr, inp_attn->get_k_idxs(), il));
 
     ggml_tensor * out = nullptr;
+    if (scatter_tiled) {
+        // Tiled scatter attention. Equivalence to the monolithic scatter path is
+        // structural, per token column t:
+        //  1. causal block  base[r][t] = (r < nvis[t]) ? 0 : -inf  is value-identical to
+        //     the dense kq_mask row for single-sequence 1d batches: the kept cells
+        //     (non-empty, same seq, pos <= pos_t) are exactly the prefix [0, nvis[t])
+        //     of the stream's cell range, and clamp(-1e9, 0) cast to F16 saturates to
+        //     -inf exactly like the dense input's mask_drop.
+        //  2. the set_rows zero-unmasking is the monolithic op applied to the column
+        //     slice [tb, tb+tn) of the same dump-mapped sel_idx tensor.
+        //  3. flash_attn_ext over the same K/V cache rows with the same additive mask
+        //     column computes the same per-token softmax (softmax never crosses query
+        //     rows); the sparse FA variant compacts identical mask values into
+        //     identical index sets.
+        //  4. wo applied per tile is a column split of the monolithic wo mul_mat.
+        // Peak memory drops from [n_kv x n_tokens] mask tensors (137 GiB at
+        // ctx=1M x batch=65536, impossible to reserve) to [n_kv x tile] blocks.
+        {
+            // dummy the dense mask input exactly like the gather path: set_input
+            // writes one element harmlessly, the reserve never sees [n_kv x n_tokens]
+            ggml_tensor * mask_dummy = ggml_new_tensor_1d(ctx0, kq_mask->type, 1);
+            ggml_set_input(mask_dummy);
+            ggml_set_name(mask_dummy, "kq_mask_scatter_tile_dummy");
+            ggml_build_forward_expand(gf, mask_dummy);
+            inp_attn->self_kq_mask     = mask_dummy;
+            inp_attn->self_kq_mask_cnv = mask_dummy;
+        }
+
+        const int64_t n_kv_attn = mctx_mla->get_n_kv();
+        const int64_t n_sel = sel->ne[0];
+        ggml_tensor * nvis = inp_attn->get_kq_nvis();
+        GGML_ASSERT(nvis != nullptr && nvis->ne[0] == n_tokens);
+
+        // seed tensors for the per-tile fills (fill overwrites the value)
+        ggml_tensor * seed_inf = ggml_cast(ctx0, ggml_view_1d(ctx0, sel, 1, 0), GGML_TYPE_F32);
+        ggml_tensor * mask_seed = kq_mask->type == GGML_TYPE_F32 ? seed_inf : ggml_cast(ctx0, seed_inf, kq_mask->type);
+        mask_seed = ggml_fill(ctx0, mask_seed, -INFINITY);
+        ggml_tensor * zero_seed = ggml_fill(ctx0, seed_inf, 0.0f);
+
+        // causal row index [n_kv]: shared by all tiles
+        ggml_tensor * rows = ggml_arange(ctx0, 0.0f, (float) n_kv_attn, 1.0f); // [n_kv]
+
+        ggml_tensor * k = mctx_mla->get_k(ctx0, il);
+        ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+        std::vector<ggml_tensor *> out_tiles;
+        for (int64_t tb = 0; tb < n_tokens; tb += scatter_tile_sz) {
+            const int64_t tn = std::min<int64_t>(scatter_tile_sz, n_tokens - tb);
+
+            // per-tile q_absorbed: the monolithic chain applied to the qr column slice
+            // (mul_mat/permute act per token column; identical op sequence => identical values)
+            auto qr_t = ggml_view_2d(ctx0, qr, qr->ne[0], tn, qr->nb[1], tb * qr->nb[1]);
+            ggml_tensor * q_t = ggml_mul_mat(ctx0, layer.wq_b, qr_t);
+            q_t = ggml_reshape_3d(ctx0, q_t, n_embd_head_qk_nope, n_head, tn);
+            q_t = ggml_permute(ctx0, q_t, 0, 2, 1, 3);
+            q_t = ggml_mul_mat(ctx0, layer.wk_b, q_t);
+            q_t = ggml_permute(ctx0, q_t, 0, 2, 1, 3); // [kv_lora, n_head, tn]
+            cb(q_t, "q_absorbed_tile", il);
+
+            // causal base block [n_kv, tn] F16
+            ggml_tensor * rows_2d = ggml_reshape_2d(ctx0,
+                    ggml_repeat(ctx0, rows, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_attn, tn)), n_kv_attn, tn);
+            auto nvis_t  = ggml_view_1d(ctx0, nvis, tn, tb * nvis->nb[0]);
+            ggml_tensor * nvis_2d = ggml_reshape_2d(ctx0,
+                    ggml_repeat(ctx0, ggml_reshape_2d(ctx0, nvis_t, 1, tn), ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_attn, tn)), n_kv_attn, tn);
+            ggml_tensor * base = ggml_clamp(ctx0, ggml_sub(ctx0, nvis_2d, rows_2d), -1e9f, 0.0f);
+            base = ggml_cast(ctx0, base, kq_mask->type);
+            cb(base, "kq_mask_causal_tile", il);
+
+            // selection unmasking: the monolithic set_rows on the column slice
+            ggml_tensor * canvas = ggml_repeat_4d(ctx0, mask_seed, 1, n_kv_attn + n_sel, tn, 1);
+            canvas = ggml_reshape_3d(ctx0, canvas, 1, n_kv_attn + n_sel, tn);
+            ggml_tensor * zeros_t = ggml_repeat_4d(ctx0, zero_seed, 1, n_sel, tn, 1);
+            zeros_t = ggml_reshape_3d(ctx0, zeros_t, 1, n_sel, tn);
+            auto idx_t = ggml_view_2d(ctx0, sel, n_sel, tn, sel->nb[1], tb * sel->nb[1]);
+            ggml_tensor * sel_t = ggml_set_rows(ctx0, canvas, zeros_t, ggml_reshape_3d(ctx0, idx_t, n_sel, tn, 1));
+            sel_t = ggml_view_2d(ctx0, sel_t, n_kv_attn, tn, sel_t->nb[2], 0);
+
+            ggml_tensor * mask_t = ggml_add(ctx0, sel_t, base);
+            cb(mask_t, "kq_mask_dsa_tile", il);
+
+            ggml_tensor * out_t = build_attn_mha(q_t, k, v, nullptr, mask_t, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+            out_t = ggml_mul_mat(ctx0, layer.wo, out_t); // wo per tile: column split of the monolithic mul
+            out_t = ggml_reshape_2d(ctx0, out_t, n_embd, tn);
+            ggml_build_forward_expand(gf, out_t);
+            out_tiles.push_back(out_t);
+        }
+
+        out = out_tiles[0];
+        for (size_t i = 1; i < out_tiles.size(); ++i) {
+            out = ggml_concat(ctx0, out, out_tiles[i], 1);
+        }
+        // wo applied per tile above
+        cb(out, "kqv_out", il);
+        cb(out, "attn_out", il);
+        return out;
+    }
     if (inp_kpool->gather) {
         // Attend over gathered latents with the token dimension in ne[3].
         // The gathered latents are 4+ MB per token, so the token dimension is processed in

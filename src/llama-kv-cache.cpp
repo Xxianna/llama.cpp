@@ -1797,6 +1797,47 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+void llama_kv_cache::set_input_kq_nvis(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    // Per-token count of visible cells under the exact keep-condition of
+    // set_input_kq_mask: cell is non-empty, belongs to the token's sequence and
+    // has pos <= token pos (no SWA/alibi for the models that consume this).
+    // For single-sequence append-order streams the kept cells are the prefix
+    // [0, count) of the stream's cell range, which is the identity the tiled
+    // scatter mask construction relies on.
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    float * data = (float *) dst->data;
+
+    // lazily built per-sequence sorted position lists (a stream's non-empty cells
+    // that belong to the sequence, in cell order == pos order for append-only caches)
+    std::unordered_map<llama_seq_id, std::vector<llama_pos>> seq_pos;
+
+    auto pos_list = [&](llama_seq_id seq_id) -> const std::vector<llama_pos> & {
+        auto it = seq_pos.find(seq_id);
+        if (it != seq_pos.end()) {
+            return it->second;
+        }
+        const auto & cells = v_cells.at(seq_to_stream.at(seq_id));
+        auto & v = seq_pos[seq_id];
+        v.reserve(cells.size());
+        for (uint32_t j = 0; j < cells.size(); ++j) {
+            if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                v.push_back(cells.pos_get(j));
+            }
+        }
+        // append-order caches are sorted; verify so a violated assumption is loud
+        GGML_ASSERT(std::is_sorted(v.begin(), v.end()) && "kq_nvis expects pos-sorted cells");
+        return v;
+    };
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        const auto & v = pos_list(seq_id);
+        data[i] = (float) (std::upper_bound(v.begin(), v.end(), ubatch->pos[i]) - v.begin());
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2919,6 +2960,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_nvis(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_kq_nvis(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

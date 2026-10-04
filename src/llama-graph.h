@@ -385,10 +385,20 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    ggml_tensor * get_kq_nvis() const { return self_kq_nvis; }
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // per-token count of visible KV cells (non-empty, same sequence, pos <= token pos).
+    // For single-sequence append-order streams the visible cells are exactly the
+    // prefix [0, count) of the stream's cell range, so an additive causal block
+    //   mask[r][t] = (r < nvis[t]) ? 0 : -inf
+    // is value-identical to the dense set_input_kq_mask row. Consumers that rely on
+    // this identity must gate on n_seqs == 1 and 1d positions.
+    ggml_tensor * self_kq_nvis = nullptr; // F32 [n_tokens]
 
     const llama_hparams hparams;
     const llama_cparams cparams;

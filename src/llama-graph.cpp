@@ -555,6 +555,10 @@ void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+    if (self_kq_nvis && self_kq_nvis->buffer) {
+        mctx->set_input_kq_nvis(self_kq_nvis, ubatch);
+    }
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
@@ -3647,6 +3651,10 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        inp->self_kq_nvis = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, ubatch.n_tokens);
+        ggml_set_input(inp->self_kq_nvis);
+        ggml_set_name(inp->self_kq_nvis, "attn_kq_nvis");
     }
 
     return inp;
