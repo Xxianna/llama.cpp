@@ -68,7 +68,11 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     // Large contiguous quantized K is served from the persistent context cache
     // (see the conversion in ggml_cuda_flash_attn_ext_f16) — no per-dst scratch.
     // The predicate mirrors the runtime one so plan and execution agree.
-    const bool k16_cached = K->type != GGML_TYPE_F16 && ggml_is_contiguous(K)
+    static const bool k16_cache_off_sz = [] {
+        const char * e = getenv("GGML_K16_OFF");
+        return e && atoi(e) != 0;
+    }();
+    const bool k16_cached = !k16_cache_off_sz && K->type != GGML_TYPE_F16 && ggml_is_contiguous(K)
         && ggml_nelements(K) >= (int64_t) 1 << 24;
 
     if (need_f16_K && K->type != GGML_TYPE_F16 && !k16_cached) {
@@ -1044,10 +1048,17 @@ void launch_fattn(
         // OOMs the compute buffer at n_kv >= ~256k. Correctness: the key changes
         // whenever n_kv changes (every ubatch appends cells), so the copy cannot go
         // stale through normal prefill/decode.
+        static const bool k16_cache_off = [] {
+            const char * e = getenv("GGML_K16_OFF");
+            return e && atoi(e) != 0;
+        }();
         const int64_t k_ne = ggml_nelements(K);
-        if (ggml_is_contiguously_allocated(K) && k_ne >= (int64_t) 1 << 24) {
+        if (!k16_cache_off && ggml_is_contiguously_allocated(K) && k_ne >= (int64_t) 1 << 24) {
             const size_t need = k_ne*sizeof(half);
             if (ctx.fattn_kv16_cap < need) {
+                if (getenv("GGML_K16_DEBUG")) {
+                    fprintf(stderr, "k16: realloc cap=%zu -> need=%zu ptr=%p\n", ctx.fattn_kv16_cap, need, ctx.fattn_kv16_ptr);
+                }
                 if (ctx.fattn_kv16_ptr != nullptr) {
                     CUDA_CHECK(cudaFree(ctx.fattn_kv16_ptr));
                 }

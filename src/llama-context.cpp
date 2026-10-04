@@ -240,7 +240,10 @@ llama_context::llama_context(
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
 
-    cparams.fused_lid = true;
+    cparams.fused_lid = [] {
+        const char * e = getenv("LLAMA_NO_FUSED_LID");
+        return !(e && atoi(e) != 0);
+    }();
     cparams.auto_flid = false;
 
     cparams.fused_dsv4_hc_pre  = true;

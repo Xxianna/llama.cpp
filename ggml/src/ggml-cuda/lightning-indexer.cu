@@ -384,17 +384,27 @@ static __global__ void lightning_indexer_kernel_vec(
 
 #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
     if (K->type == (type_K)) {                                                              \
-        lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
-            <<<grid, block, 0, ctx.stream()>>>(                                             \
-            q_d, k_d, w_d, m_d, dst_d,                                                      \
-            n_stream, n_batch, n_kv,                                                        \
-            nb1, nb2, nb3,                                                                  \
-            nbq1, nbq2, nbq3,                                                               \
-            nbk1, nbk2, nbk3,                                                               \
-            nbw1, nbw2, nbw3,                                                               \
-            nbm1, nbm2, nbm3,                                                               \
-            nem3                                                                            \
-        );                                                                                  \
+        /* gridDim.y caps at 65535; batch the y (n_batch) axis by offsetting the          */ \
+        /* batch-row pointers (q/w/m/dst use per-batch strides, k is batch-independent)   */ \
+        for (int b0 = 0; b0 < n_batch; b0 += 65535) {                                      \
+            const int nb_l = std::min(n_batch - b0, 65535);                                \
+            const dim3 grid_l(num_kv_blocks, nb_l, n_stream);                              \
+            const float * q_b = (const float *) ((const char *) q_d + (int64_t) b0*nbq2);   \
+            const float * w_b = (const float *) ((const char *) w_d + (int64_t) b0*nbw1);   \
+            const half  * m_b = (const half  *) ((const char *) m_d + (int64_t) b0*nbm1);   \
+            float       * dst_b = (float       *) ((char *) dst_d + (int64_t) b0*nb1);      \
+            lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
+                <<<grid_l, block, 0, ctx.stream()>>>(                                      \
+                q_b, k_d, w_b, m_b, dst_b,                                                  \
+                n_stream, nb_l, n_kv,                                                        \
+                nb1, nb2, nb3,                                                              \
+                nbq1, nbq2, nbq3,                                                           \
+                nbk1, nbk2, nbk3,                                                           \
+                nbw1, nbw2, nbw3,                                                           \
+                nbm1, nbm2, nbm3,                                                           \
+                nem3                                                                        \
+            );                                                                              \
+        }                                                                                   \
     } else
 
 void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

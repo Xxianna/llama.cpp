@@ -1137,7 +1137,13 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
-    GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
+    // the split-score path replaces the dense [n_pool x n_tokens] mask with a 1x1
+    // dummy (chunk masks are computed on GPU from pool_nvis, see build_inp_kpool);
+    // tolerate it here instead of asserting
+    const bool pool_mask_dummy = pool_mask->ne[0] == 1 && pool_mask->ne[1] == 1;
+    if (!pool_mask_dummy) {
+        GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
+    }
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(st.cache_safe == (new_pool_rep != nullptr));
@@ -1291,7 +1297,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     };
-    if (pool_mask->type == GGML_TYPE_F16) {
+    if (pool_mask_dummy) {
+        // nothing to fill: the split-score path reads pool_nvis, not this tensor
+    } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);
