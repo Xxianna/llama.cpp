@@ -435,14 +435,23 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         const bool mtp_share = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mctx_hyb->get_mtp_dsa_index_share();
 
         inp->n_sel = (uint32_t) n_sel;
-        // GGML_DSA_GATHER_PREFILL=1: use the (now tiled) gather path for big prefill batches too —
-        // the scatter path materializes an [n_kv x n_tokens] f16 mask and runs full O(n_kv*n_tokens)
-        // flash attention over it, which is prohibitive at long contexts.
+        // GGML_DSA_GATHER_PREFILL=1: use the (tiled) gather path for big prefill batches too.
+        // Default now: big prefill batches take the TILED SCATTER path instead
+        // (GGML_DSA_SCATTER_TILE, default on) — reference-equivalent semantics with
+        // [n_kv x tile] computed mask blocks and the sparse flash-attention kernel;
+        // only batches it does not cover (multi-sequence / 2d-rope) fall back to gather.
         static const bool gather_prefill = [] {
             const char * e = getenv("GGML_DSA_GATHER_PREFILL");
             return e && atoi(e) != 0;
         }();
-        inp->gather = ((int64_t) n_tokens <= max_ub || gather_prefill) && (int64_t) n_kv > n_sel;
+        static const int64_t scatter_tile_cfg = [] {
+            const char * e = getenv("GGML_DSA_SCATTER_TILE");
+            return e ? atoll(e) : 1024;
+        }();
+        // must match the gate computed in build_dsa_layer for the same ubatch
+        const bool scatter_tile_ok = scatter_tile_cfg > 0 && !gather_prefill
+            && (int64_t) n_tokens > scatter_tile_cfg && ubatch.n_seqs == 1 && !ubatch.is_pos_2d();
+        inp->gather = ((int64_t) n_tokens <= max_ub || gather_prefill || !scatter_tile_ok) && (int64_t) n_kv > n_sel;
         inp->mtp_share = mtp_share;
 
         // Both paths read the slot mask: gather adds it to the scores, scatter maps its dead slots to dump rows.
@@ -1167,10 +1176,17 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     // cell indices; the per-token mask blocks are built per tile by the caller. The dump
     // mapping below is the exact computation the monolithic path performs before its
     // set_rows, so both paths consume identical sel_idx values.
-    static const bool scatter_tiled = [] {
+    static const int64_t scatter_tile_cfg = [] {
         const char * e = getenv("GGML_DSA_SCATTER_TILE");
-        return e ? atoll(e) > 0 : true;
+        return e ? atoll(e) : 1024;
     }();
+    static const bool gather_prefill_cfg = [] {
+        const char * e = getenv("GGML_DSA_GATHER_PREFILL");
+        return e && atoi(e) != 0;
+    }();
+    const bool scatter_tiled = !gather_prefill_cfg && !inp_kpool->gather
+        && scatter_tile_cfg > 0 && n_tokens > scatter_tile_cfg
+        && ubatch.n_seqs == 1 && !ubatch.is_pos_2d();
     if (scatter_tiled) {
         ggml_tensor * seed_r = ggml_cast(ctx0, ggml_view_1d(ctx0, sel_idx, 1, 0), GGML_TYPE_F32);
         ggml_tensor * live_r  = ggml_exp(ctx0, ggml_reshape_2d(ctx0, inp_kpool->gather_mask, n_sel, n_tokens));
@@ -1283,6 +1299,11 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
     ggml_tensor * out = nullptr;
     if (scatter_tiled) {
+        // the dense-mask dummy created by build_attn_inp_kq_mask is not referenced by
+        // any node: expand it so gallocr assigns it a buffer (set_input writes one
+        // element into it harmlessly) -- same trick the gather branch has always used
+        ggml_build_forward_expand(gf, kq_mask);
+
         // Tiled scatter attention. Equivalence to the monolithic scatter path is
         // structural, per token column t:
         //  1. causal block  base[r][t] = (r < nvis[t]) ? 0 : -inf  is value-identical to
