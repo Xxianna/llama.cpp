@@ -1298,11 +1298,30 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     };
     if (pool_mask_dummy) {
-        // nothing to fill: the split-score path reads pool_nvis, not this tensor
+        // the split-score path reads pool_nvis as its only causal-mask source: fill it
+        // (this used to live inside fill_mask, which the dummy branch never called --
+        // every split-path selection since the nvis rework ran with all-zero nvis)
+        if (pool_nvis != nullptr && pool_nvis->buffer) {
+            float * nv_data = (float *) pool_nvis->data;
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const llama_seq_id s = ubatch->seq_id[i][0];
+                const llama_pos    p = ubatch->pos[i];
+                const uint32_t p0 = seq_pool_start[s];
+                const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
+                const uint32_t nv = (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
+                nv_data[i] = (float) (p0 + nv);
+            }
+        }
     } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);
+    }
+
+    if (getenv("GGML_DSA_SEL_DUMP") && pool_nvis != nullptr && pool_nvis->buffer) {
+        const float * nv = (const float *) pool_nvis->data;
+        fprintf(stderr, "sel-dump host pool_nvis: [0]=%g [mid]=%g [last]=%g n_tokens=%u\n",
+                nv[0], nv[n_tokens/2], nv[n_tokens-1], n_tokens);
     }
 
     int32_t * tidx = (int32_t *) tail_idxs->data;
