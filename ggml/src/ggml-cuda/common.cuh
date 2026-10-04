@@ -1448,6 +1448,19 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // Persistent f16 copy of a LARGE quantized K/V cache for flash attention
+    // (see fattn-common.cuh). Big-K conversions are cached here instead of being
+    // re-done into a per-call scratch for every FA invocation: at n_kv=262144 the
+    // per-call [512 x n_kv] scratch (one attached to EVERY FA output tensor's
+    // extra space) destabilizes the compute-buffer layout and OOMs. Keyed on
+    // (source data pointer, element count): prefill/decode grow n_kv every ubatch,
+    // so a rewrite with an unchanged element count cannot go unnoticed through
+    // normal generation.
+    const void * fattn_kv16_src = nullptr;
+    int64_t      fattn_kv16_ne  = 0;
+    void       * fattn_kv16_ptr = nullptr;
+    size_t       fattn_kv16_cap = 0;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

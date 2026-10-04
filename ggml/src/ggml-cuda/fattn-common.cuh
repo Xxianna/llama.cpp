@@ -65,13 +65,19 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    // Large contiguous quantized K is served from the persistent context cache
+    // (see the conversion in ggml_cuda_flash_attn_ext_f16) — no per-dst scratch.
+    // The predicate mirrors the runtime one so plan and execution agree.
+    const bool k16_cached = K->type != GGML_TYPE_F16 && ggml_is_contiguous(K)
+        && ggml_nelements(K) >= (int64_t) 1 << 24;
+
+    if (need_f16_K && K->type != GGML_TYPE_F16 && !k16_cached) {
         data.end = GGML_PAD(data.end, 128);
         data.K   = data.end;
         data.end += ggml_nelements(K)*ggml_type_size(GGML_TYPE_F16);
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (need_f16_V && V->type != GGML_TYPE_F16 && !k16_cached) {
         if (V_is_K_view) {
             data.V = data.K;
         } else {
@@ -1032,6 +1038,44 @@ void launch_fattn(
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
+        // Large quantized K: convert ONCE per (cache storage, element count) into a
+        // persistent context buffer shared by every FA invocation reading the same
+        // cache — instead of a per-call [rows x n_kv] scratch whose layout churn
+        // OOMs the compute buffer at n_kv >= ~256k. Correctness: the key changes
+        // whenever n_kv changes (every ubatch appends cells), so the copy cannot go
+        // stale through normal prefill/decode.
+        const int64_t k_ne = ggml_nelements(K);
+        if (ggml_is_contiguously_allocated(K) && k_ne >= (int64_t) 1 << 24) {
+            const size_t need = k_ne*sizeof(half);
+            if (ctx.fattn_kv16_cap < need) {
+                if (ctx.fattn_kv16_ptr != nullptr) {
+                    CUDA_CHECK(cudaFree(ctx.fattn_kv16_ptr));
+                }
+                CUDA_CHECK(cudaMalloc(&ctx.fattn_kv16_ptr, need));
+                ctx.fattn_kv16_cap = need;
+                ctx.fattn_kv16_src = nullptr; // force reconvert after realloc
+            }
+            if (ctx.fattn_kv16_src != (const void *) K_data || ctx.fattn_kv16_ne != k_ne) {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+                to_fp16(K_data, (half *) ctx.fattn_kv16_ptr, k_ne, main_stream);
+                ctx.fattn_kv16_src = (const void *) K_data;
+                ctx.fattn_kv16_ne  = k_ne;
+            }
+            half * K_f16 = (half *) ctx.fattn_kv16_ptr;
+            nb11 = nb11*bs*sizeof(half)/ts;
+            nb12 = nb12*bs*sizeof(half)/ts;
+            nb13 = nb13*bs*sizeof(half)/ts;
+            K_data = (char *) K_f16;
+
+            if (need_f16_V && V_is_K_view) {
+                V_data = K_data;
+                nb21 = nb11;
+                nb22 = nb12;
+                nb23 = nb13;
+            }
+            goto K_done;
+        }
+
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
         if (ggml_is_contiguously_allocated(K)) {
@@ -1055,6 +1099,8 @@ void launch_fattn(
         }
         K_data = (char *) K_f16;
     }
+
+K_done:;
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
         if (V_is_K_view) {
