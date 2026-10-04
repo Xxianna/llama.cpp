@@ -1237,6 +1237,13 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
+    // this wrapper shadows llm_graph_input_attn_k::set_input (which fills self_kq_nvis):
+    // the nvis fill was missing here, so every GLM-DSA ubatch delivered an all-zero
+    // visible count and the split-score selection ran blind
+    if (inp_attn->self_kq_nvis && inp_attn->self_kq_nvis->buffer) {
+        mctx->get_attn()->set_input_kq_nvis(inp_attn->self_kq_nvis, ubatch);
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {

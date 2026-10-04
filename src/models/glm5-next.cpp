@@ -1106,7 +1106,11 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
                     // to global pool ids: add the chunk's first row
                     if (c0 != 0) {
                         tp = ggml_cast(ctx0, tp, GGML_TYPE_F32);
-                        auto off_j = ggml_view_1d(ctx0, inp_kpool->chunk_offsets, 1, j); // [1] f32 broadcast
+                        // the view offset is in BYTES: the chunk index must be scaled
+                        // (unscaled it read a float straddling bytes [j, j+4) -- a misaligned
+                        // CUDA read on GPU-resident offsets, and a straddle value of 0.0 through
+                        // the host copies, silently leaving chunk-local pool ids)
+                        auto off_j = ggml_view_1d(ctx0, inp_kpool->chunk_offsets, 1, j * inp_kpool->chunk_offsets->nb[0]); // [1] f32 broadcast
                         tp = ggml_add(ctx0, tp, off_j);
                     }
                     chunk_tp.push_back(tp);
@@ -1120,16 +1124,26 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
                 // top-k(prev best, chunk j) is exactly top-k of the union (selection
                 // commutes), each step is [2*n_top, tn] and the intermediates rotate.
                 auto merge_top_k = [&](ggml_tensor * tp_cat, ggml_tensor * ss_cat) {
-                    // tp_cat/ss_cat: [m >= n_top, tn] f32, global pool ids and their scores
-                    ggml_tensor * tk = ggml_top_k(ctx0, ss_cat, n_top_pool); // unordered
+                    // tp_cat/ss_cat: [m >= n_top, tn] f32, global pool ids and their scores.
+                    // Same recovery as the monolithic path: top-k gives unordered candidate ids;
+                    // order the IDS by descending score, then gather both tp and ss by those ids
+                    // (gathering tp_cat by the argsort RANKS, as this once did, can only reach
+                    // rows [0, n_top) of the concatenation -- the new chunk's candidates are
+                    // unreachable and the merge degrades to reordering the previous best)
+                    ggml_tensor * tk = ggml_top_k(ctx0, ss_cat, n_top_pool); // candidate ids, unordered
                     ggml_tensor * sel_score = ggml_get_rows(ctx0,
                             ggml_reshape_3d(ctx0, ss_cat, 1, tp_cat->ne[0], tn), tk);
                     ggml_tensor * sel_order = ggml_argsort(ctx0,
                             ggml_reshape_2d(ctx0, sel_score, n_top_pool, tn), GGML_SORT_ORDER_DESC);
+                    tk = ggml_get_rows(ctx0,
+                            ggml_reshape_3d(ctx0, tk, 1, n_top_pool, tn), sel_order);
+                    tk = ggml_reshape_2d(ctx0, tk, n_top_pool, tn); // get_rows yields [1, n_top, tn]
                     ggml_tensor * tp = ggml_get_rows(ctx0,
-                            ggml_reshape_3d(ctx0, tp_cat, 1, tp_cat->ne[0], tn), sel_order);
+                            ggml_reshape_3d(ctx0, tp_cat, 1, tp_cat->ne[0], tn), tk);
+                    ggml_tensor * ss = ggml_get_rows(ctx0,
+                            ggml_reshape_3d(ctx0, sel_score, 1, n_top_pool, tn), sel_order);
                     return std::make_pair(ggml_reshape_2d(ctx0, tp, n_top_pool, tn),
-                                          ggml_reshape_2d(ctx0, sel_score, n_top_pool, tn));
+                                          ggml_reshape_2d(ctx0, ss, n_top_pool, tn));
                 };
 
                 ggml_tensor * tp_run = ggml_cast(ctx0, chunk_tp[0], GGML_TYPE_F32);
