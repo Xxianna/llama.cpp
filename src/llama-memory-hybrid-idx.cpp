@@ -1318,6 +1318,19 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         fill_mask((float *) pool_mask->data);
     }
 
+    if (getenv("GGML_DSA_SEL_DUMP") && gm != nullptr) {
+        const int64_t ntok = (int64_t) gather_mask->ne[3];
+        auto gmv = [&](int64_t tok) {
+            return ((const float *) gm)[(size_t) tok * n_sel];
+        };
+        char b1[128] = {0}, b2[128] = {0}, b3[128] = {0};
+        snprintf(b1, sizeof(b1), "%.3g,%.3g,%.3g,%.3g", gmv(512), gmv(512)+1, gmv(49152), ((const float *) gm)[(size_t) 49152 * n_sel + 1]);
+        snprintf(b2, sizeof(b2), "%.3g", ((const float *) gm)[(size_t) 49152 * n_sel + 2047]);
+        snprintf(b3, sizeof(b3), "%.3g", ((const float *) gm)[(size_t) (ntok - 1) * n_sel]);
+        fprintf(stderr, "gm-host ntok=%lld gm[512]=%s gm[49152s2050]=%s gm[last]=%s\n",
+                (long long) ntok, b1, b2, b3);
+    }
+
     if (getenv("GGML_DSA_SEL_DUMP") && pool_nvis != nullptr && pool_nvis->buffer) {
         const float * nv = (const float *) pool_nvis->data;
         fprintf(stderr, "sel-dump host pool_nvis: [0]=%g [mid]=%g [last]=%g n_tokens=%u\n",

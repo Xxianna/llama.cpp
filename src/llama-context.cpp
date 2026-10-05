@@ -1716,6 +1716,79 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// GGML_DSA_STAGE_DUMP=1: fires after every node eval; for layer-3 selection-chain stage
+// tensors it dumps the first 8 values at the corruption-boundary token column (49152)
+// plus a clean control column, so the FIRST divergent stage is visible in one run.
+static bool dsa_stage_dump_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
+    if (ask) {
+        return true;
+    }
+    if (t == nullptr || t->data == nullptr) {
+        return true;
+    }
+    const char * n = ggml_get_name(t);
+    if (n == nullptr || n[0] == '\0') {
+        return true;
+    }
+    const bool per_tile = t->ne[1] > 0 && t->ne[1] <= 8192 && t->ne[1] >= 512;
+    const bool stage = strstr(n, "indexer_score_split-3") != nullptr ||
+                       strstr(n, "indexer_top_k-3") != nullptr ||
+                       strstr(n, "indexer_sel_t-3") != nullptr ||
+                       strstr(n, "indexer_sel_cat-3") != nullptr ||
+                       strstr(n, "indexer_sel_idx-3") != nullptr ||
+                       strstr(n, "indexer_sel_idx_mapped-3") != nullptr ||
+                       strstr(n, "kpool_gather_mask") != nullptr;
+    (void) per_tile;
+    if (!stage) {
+        return true;
+    }
+    int64_t ncols = t->ne[1] > 0 ? t->ne[1] : 1;
+    if (t->ne[3] > 1 && ncols == 1) {
+        ncols = t->ne[3]; // 4d [n_sel, 1, 1, n_tokens] inputs: columns live in ne[3]
+        t = t; // strides: nb[3] is the column stride (handled below via nb[1]? no)
+    }
+    const int64_t row   = t->ne[0];
+    auto col_head = [&](int64_t col) -> std::string {
+        if (col >= ncols) {
+            return std::string("oob");
+        }
+        const int64_t k = std::min<int64_t>(8, row);
+        // backend-safe read: tensors may live on the device (direct host deref crashes)
+        char tmp[8 * 8];
+        const size_t es = ggml_element_size(t);
+        const size_t want = (size_t) k * t->nb[0];
+        const size_t colstride = (t->ne[3] > 1 && t->ne[1] == 1) ? t->nb[3] : t->nb[1];
+        ggml_backend_tensor_get(t, tmp, (size_t) col * colstride, want);
+        std::string out;
+        for (int64_t i = 0; i < k; ++i) {
+            char item[48];
+            if (t->type == GGML_TYPE_I32) {
+                snprintf(item, sizeof(item), "%d", *((const int32_t *) (tmp + i * t->nb[0])));
+            } else if (t->type == GGML_TYPE_F32) {
+                snprintf(item, sizeof(item), "%.4g", *((const float *) (tmp + i * t->nb[0])));
+            } else {
+                snprintf(item, sizeof(item), "?");
+            }
+            out += item;
+            if (i + 1 < k) {
+                out += ",";
+            }
+        }
+        return out;
+    };
+    if (per_tile && stage) {
+        // per-tile stage (score/top_k of one 2048-token tile): dump local col 0
+        LLAMA_LOG_ERROR("STAGE %-32s [%lld x %lld] t=%d col0:%s | col1024:%s\n",
+                n, (long long) row, (long long) ncols, (int) t->type,
+                col_head(0).c_str(), col_head(ncols > 1024 ? 1024 : ncols - 1).c_str());
+    } else if (stage) {
+        LLAMA_LOG_ERROR("STAGE %-32s [%lld x %lld] t=%d col512:%s | col49152:%s\n",
+                n, (long long) row, (long long) ncols, (int) t->type,
+                col_head(512).c_str(), col_head(49152).c_str());
+    }
+    return true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1747,6 +1820,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (cparams.cb_eval == nullptr && getenv("GGML_DSA_STAGE_DUMP") != nullptr) {
+            ggml_backend_sched_set_eval_callback(sched.get(), dsa_stage_dump_cb, nullptr);
+        }
 
         //const auto t_start_us = ggml_time_us();
 

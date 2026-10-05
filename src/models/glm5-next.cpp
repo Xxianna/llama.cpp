@@ -475,6 +475,7 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
 
         // Both paths read the slot mask: gather adds it to the scores, scatter maps its dead slots to dump rows.
         inp->gather_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_sel, 1, 1, n_tokens);
+        ggml_set_name(inp->gather_mask, "kpool_gather_mask");
         ggml_set_input(inp->gather_mask);
         // Keep the mask allocated even when no op reads it, because set_input_kpool always fills it.
         ggml_build_forward_expand(gf, inp->gather_mask);
@@ -1163,6 +1164,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 
                 ggml_tensor * sel_t = ggml_get_rows(ctx0, pool_idxs,
                         ggml_reshape_1d(ctx0, top_k, n_top_pool * tn));
+                cb(sel_t, "indexer_sel_t", il);
                 sel_tiles.push_back(ggml_reshape_2d(ctx0, sel_t, kpool * n_top_pool, tn));
             }
 
@@ -1171,10 +1173,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
                 sel_idx = ggml_concat(ctx0, sel_idx, sel_tiles[t], 1);
             }
             sel_idx = ggml_reshape_2d(ctx0, sel_idx, kpool * n_top_pool, n_tokens);
+            cb(sel_idx, "indexer_sel_cat", il);
 
             if (hparams.indexer_kpool_select_tail) {
                 sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
             }
+            cb(sel_idx, "indexer_sel_idx", il);
         } else {
         // monolithic score path: materialize the full indexer query here
         iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
