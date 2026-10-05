@@ -1,13 +1,13 @@
 # llama.cpp-glm-fast
 
+[![English](https://img.shields.io/badge/English-page-blue)](https://xxianna.github.io/llama.cpp-glm-fast/?lang=en)
+
 更好的 GLM-5.3-Flash 混合推理方案。
 
 - 混合推理：更低的显存需求
 - 修复对GLM-5.3-Flash 1M上下文和大batch叠加的支持，降低长输入对PCIE带宽的依赖
 - 保留热门专家缓存机制，降低cpu计算量
 - 分段选择prefill、decode计算方式，提高不同上下文背景下的速度
-
-**在线页面**：<https://xxianna.github.io/llama.cpp-glm-fast/>（GitHub Pages，页内中/EN 切换）
 
 ## 1. 测试数据
 

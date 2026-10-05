@@ -213,7 +213,9 @@
     root.lang = en ? 'en' : 'zh-CN';
     try { localStorage.setItem('lang', en ? 'en' : 'zh'); } catch (e) {}
   }
-  try { set(localStorage.getItem('lang') === 'en'); } catch (e) {}
+  var urlEn = /[?#&]lang=en(^|&|$)/.test(location.search) || /(^|#)en($|&)/.test(location.hash);
+  if (urlEn) { set(true); }
+  else { try { set(localStorage.getItem('lang') === 'en'); } catch (e) {} }
   document.getElementById('lang-toggle').addEventListener('click', function () {
     set(!root.classList.contains('lang-en'));
   });
