@@ -61,6 +61,55 @@ env CUDA_VISIBLE_DEVICES=<GPU UUID> \
 
 </details>
 
+<details>
+<summary><b>CMP 170HX 62 GB（PCIe 2.0）· EPYC 7642 · GLM-5.3-Flash Q4_K_M · 1M 上下文</b></summary>
+
+### 测试环境
+
+| 项目 | 配置 |
+| --- | --- |
+| GPU | CMP 170HX 62 GB，PCIe 2.0 |
+| CPU / 内存 | EPYC 7642（48 核），8 通道 DDR4-2133，实测约 100 GB/s |
+| 模型 | GLM-5.3-Flash Uncensored Q4_K_M（179.7 GB，4.81 BPW） |
+| 推理形态 | 非专家权重与 KV（q8_0）驻 GPU；路由专家驻 CPU 内存；54 专家缓存槽/层 |
+| 服务参数 | 上下文 1,048,576；batch 16,384；并发 1 |
+
+### 性能
+
+完整阶梯测量，同一会话，每点输入后生成 128 token：
+
+| 输入长度 (token) | Prefill (token/s) | Decode (token/s) |
+| ---: | ---: | ---: |
+| 64 | 56.61 | 16.99 |
+| 256 | 86.56 | 17.06 |
+| 1,024 | 49.66 | 16.99 |
+| 4,096 | 158.33 | 16.06 |
+| 16,384 | 273.80 | 15.83 |
+| 65,536 | 277.44 | 17.09 |
+| 262,144 | 217.37 | 15.93 |
+
+
+显存：1M 上下文全额预留（q8_0 KV）+ 54 槽专家缓存 + 视觉适配器，空闲 59.8 GB，峰值预算 62 GB。
+
+### 启动命令
+
+```bash
+env CUDA_VISIBLE_DEVICES=<GPU UUID> \
+    GGML_SCHED_H2D_ASYNC=1 \
+    LLAMA_MOE_CACHE_MAX_BATCH=512 \
+    GGML_DSA_SCATTER_TILE=512 \
+    ./build-release/bin/llama-server \
+    -m <模型路径>/GLM-5.3-Flash-Uncensored-Q4_K_M-00001-of-00005.gguf \
+    --mmproj <模型路径>/mmproj-GLM-5.3-Flash-Uncensored-F16.gguf \
+    -ngl 99 --cpu-moe --moe cache=54 -fa on -np 1 \
+    -c 1048576 -ctk q8_0 -ctv q8_0 -t 48 -b 16384 -ub 16384 \
+    --host 0.0.0.0 --port 8300 --alias glm53f --jinja
+```
+
+环境变量同 4090D 组。`cache=54` 为每层专家缓存槽数，是 62 GB 预算下的填满值（边际约 0.59 GB/槽）。
+
+</details>
+
 ## 2. 显存占用估算
 
 显存 ≈ GPU 驻留权重 + KV 缓存 + KDA 循环状态 + 视觉适配器 + k16 转换缓存 + 专家缓存 + 计算池：

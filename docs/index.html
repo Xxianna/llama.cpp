@@ -115,6 +115,48 @@
 
 </details>
 
+<details>
+<summary><b>CMP 170HX 62 GB（PCIe 2.0）· EPYC 7642 · GLM-5.3-Flash Q4_K_M · 1M</b></summary>
+
+<h3><span class="zh">测试环境</span><span class="en">Environment</span></h3>
+<table>
+  <tr><th><span class="zh">项目</span><span class="en">Item</span></th><th><span class="zh">配置</span><span class="en">Configuration</span></th></tr>
+  <tr><td>GPU</td><td><span class="zh">CMP 170HX 62 GB，PCIe 2.0</span><span class="en">CMP 170HX 62 GB, PCIe 2.0</span></td></tr>
+  <tr><td><span class="zh">CPU / 内存</span><span class="en">CPU / RAM</span></td><td><span class="zh">EPYC 7642（48 核），8 通道 DDR4-2133，实测约 100 GB/s</span><span class="en">EPYC 7642 (48 cores), 8-channel DDR4-2133, ~100 GB/s measured</span></td></tr>
+  <tr><td><span class="zh">模型</span><span class="en">Model</span></td><td><span class="zh">GLM-5.3-Flash Uncensored Q4_K_M（179.7 GB，4.81 BPW）——<a href="https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF">unsloth GGUF</a>（五分片 + mmproj）</span><span class="en">GLM-5.3-Flash Uncensored Q4_K_M (179.7 GB, 4.81 BPW) — <a href="https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF">unsloth GGUF</a> (five shards + mmproj)</span></td></tr>
+  <tr><td><span class="zh">推理形态</span><span class="en">Inference form</span></td><td><span class="zh">非专家权重与 KV（q8_0）驻 GPU；路由专家驻 CPU 内存；54 专家缓存槽/层</span><span class="en">Non-expert weights and KV (q8_0) on GPU; routed experts in CPU RAM; 54 expert-cache slots per layer</span></td></tr>
+  <tr><td><span class="zh">服务参数</span><span class="en">Server</span></td><td><span class="zh">上下文 1,048,576；batch 16,384；并发 1</span><span class="en">Context 1,048,576; batch 16,384; concurrency 1</span></td></tr>
+</table>
+
+<h3><span class="zh">性能</span><span class="en">Performance</span></h3>
+<p><span class="zh">完整阶梯测量，同一会话，每点输入后生成 128 token：</span><span class="en">Full ladder, one session, 128 tokens generated per point:</span></p>
+<table>
+  <tr><th><span class="zh">输入长度 (token)</span><span class="en">Input length (tokens)</span></th><th class="num">Prefill (token/s)</th><th class="num">Decode (token/s)</th></tr>
+  <tr><td class="num">64</td><td class="num">56.61</td><td class="num">16.99</td></tr>
+  <tr><td class="num">256</td><td class="num">86.56</td><td class="num">17.06</td></tr>
+  <tr><td class="num">1,024</td><td class="num">49.66</td><td class="num">16.99</td></tr>
+  <tr><td class="num">4,096</td><td class="num">158.33</td><td class="num">16.06</td></tr>
+  <tr><td class="num">16,384</td><td class="num">273.80</td><td class="num">15.83</td></tr>
+  <tr><td class="num">65,536</td><td class="num">277.44</td><td class="num">17.09</td></tr>
+  <tr><td class="num">262,144</td><td class="num">217.37</td><td class="num">15.93</td></tr>
+</table>
+<p><span class="zh">显存：1M 上下文全额预留（q8_0 KV）+ 54 槽专家缓存 + 视觉适配器，空闲 59.8 GB，峰值预算 62 GB。</span><span class="en">VRAM: full 1M-context reservation (q8_0 KV) + 54-slot expert cache + vision adapter, 59.8 GB idle against a 62 GB peak budget.</span></p>
+
+<h3><span class="zh">启动命令</span><span class="en">Launch command</span></h3>
+<pre><code>env CUDA_VISIBLE_DEVICES=&lt;GPU UUID&gt; \
+    GGML_SCHED_H2D_ASYNC=1 \
+    LLAMA_MOE_CACHE_MAX_BATCH=512 \
+    GGML_DSA_SCATTER_TILE=512 \
+    ./build-release/bin/llama-server \
+    -m &lt;model path&gt;/GLM-5.3-Flash-Uncensored-Q4_K_M-00001-of-00005.gguf \
+    --mmproj &lt;model path&gt;/mmproj-GLM-5.3-Flash-Uncensored-F16.gguf \
+    -ngl 99 --cpu-moe --moe cache=54 -fa on -np 1 \
+    -c 1048576 -ctk q8_0 -ctv q8_0 -t 48 -b 16384 -ub 16384 \
+    --host 0.0.0.0 --port 8300 --alias glm53f --jinja</code></pre>
+<p><span class="zh">环境变量同 4090D 组。<code>cache=54</code> 为每层专家缓存槽数，是 62 GB 预算下的填满值（边际约 0.59 GB/槽）。</span><span class="en">Environment variables as in the 4090D group. <code>cache=54</code> is the per-layer slot count that fills the 62 GB budget (~0.59 GB per slot at the margin).</span></p>
+
+</details>
+
 <h2 id="vram"><span class="zh">2. 显存占用估算</span><span class="en">2. VRAM estimation</span></h2>
 <p><span class="zh">显存 ≈ GPU 驻留权重 + KV 缓存 + KDA 循环状态 + 视觉适配器 + k16 转换缓存 + 专家缓存 + 计算池：</span><span class="en">VRAM ≈ GPU-resident weights + KV cache + KDA recurrent state + vision adapter + k16 conversion cache + expert cache + compute pool:</span></p>
 <table>
