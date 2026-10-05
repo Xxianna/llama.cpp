@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>llama.cpp-glm-fast — GLM-5.3-Flash 混合推理</title>
+<title>llama.cpp-glm-fast — GLM-5.3-Flash 混合推理 / hybrid inference</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -19,7 +19,11 @@
     .nav { background: #161b22; border-color: #30363d !important; }
     details { border-color: #30363d !important; }
     summary { background: #161b22 !important; }
+    #lang-toggle { background: #21262d !important; color: #e6edf3 !important; border-color: #30363d !important; }
   }
+  /* 语言切换：每个组件内联 .zh/.en，由根类二选一显示 */
+  html.lang-en .zh { display: none; }
+  html:not(.lang-en) .en { display: none; }
   .wrap { max-width: 980px; margin: 0 auto; padding: 24px 20px 64px; }
   h1 { font-size: 1.9em; border-bottom: 2px solid #d0d7de; padding-bottom: .35em; }
   h2 { font-size: 1.4em; border-bottom: 1px solid #d0d7de; padding-bottom: .3em; margin-top: 2em; }
@@ -30,6 +34,10 @@
     border-radius: 8px; padding: 8px 14px; margin: 0 0 24px; font-size: .95em;
   }
   .nav a { margin-right: 1.2em; white-space: nowrap; }
+  #lang-toggle {
+    float: right; cursor: pointer; font: inherit; font-weight: 600;
+    background: #ffffff; color: #1f2328; border: 1px solid #d0d7de; border-radius: 6px; padding: 2px 12px;
+  }
   table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: .95em; }
   th, td { border: 1px solid #d0d7de; padding: 6px 12px; text-align: left; vertical-align: top; }
   th { background: #f6f8fa; }
@@ -43,45 +51,44 @@
   details[open] summary { border-bottom: 1px dashed #d0d7de; margin-bottom: 8px; }
   ul { padding-left: 1.5em; } li { margin: .35em 0; }
   .footer { margin-top: 48px; border-top: 1px solid #d0d7de; padding-top: 12px; font-size: .88em; color: #656d76; }
-  .formula { font-family: ui-monospace, Consolas, monospace; background: #f6f8fa; border: 1px solid #d0d7de;
-             border-radius: 8px; padding: 12px 16px; overflow-x: auto; white-space: pre; margin: 1em 0; }
 </style>
 </head>
 <body>
 <div class="wrap">
 
 <nav class="nav" id="top">
-  <a href="#intro">简介</a><a href="#bench">测试数据</a><a href="#vram">显存估算</a><a href="#routing">路径路由</a><a href="#opt">优化内容</a><a href="#baseline">与基线的关系</a><a href="https://github.com/Xxianna/llama.cpp">GitHub 仓库 ↗</a>
+  <button id="lang-toggle" type="button">EN / 中文</button>
+  <a href="#intro"><span class="zh">简介</span><span class="en">Intro</span></a><a href="#bench"><span class="zh">测试数据</span><span class="en">Benchmarks</span></a><a href="#vram"><span class="zh">显存估算</span><span class="en">VRAM</span></a><a href="#routing"><span class="zh">路径路由</span><span class="en">Routing</span></a><a href="#opt"><span class="zh">优化内容</span><span class="en">Optimizations</span></a><a href="#baseline"><span class="zh">与基线的关系</span><span class="en">vs baselines</span></a><a href="https://github.com/Xxianna/llama.cpp-glm-fast"><span class="zh">GitHub 仓库 ↗</span><span class="en">GitHub repo ↗</span></a>
 </nav>
 
 <h1>llama.cpp-glm-fast</h1>
-<p id="intro">更好的 GLM-5.3-Flash 混合推理方案。</p>
+<p id="intro"><span class="zh">更好的 GLM-5.3-Flash 混合推理方案。</span><span class="en">A better hybrid-inference setup for GLM-5.3-Flash.</span></p>
 <ul>
-  <li>混合推理：更低的显存需求</li>
-  <li>修复对 GLM-5.3-Flash 1M 上下文和大 batch 叠加的支持，降低长输入对 PCIE 带宽的依赖</li>
-  <li>保留热门专家缓存机制，降低 cpu 计算量</li>
-  <li>分段选择 prefill、decode 计算方式，提高不同上下文背景下的速度</li>
+  <li><span class="zh">混合推理：更低的显存需求</span><span class="en">Hybrid inference: much lower VRAM requirement</span></li>
+  <li><span class="zh">修复对 GLM-5.3-Flash 1M 上下文和大 batch 叠加的支持，降低长输入对 PCIE 带宽的依赖</span><span class="en">Fixed GLM-5.3-Flash support for 1M context combined with large batches, reducing long inputs' dependence on PCIe bandwidth</span></li>
+  <li><span class="zh">保留热门专家缓存机制，降低 cpu 计算量</span><span class="en">Keeps the hot-expert cache, reducing CPU compute</span></li>
+  <li><span class="zh">分段选择 prefill、decode 计算方式，提高不同上下文背景下的速度</span><span class="en">Selects prefill/decode execution paths by shape, improving speed across context lengths</span></li>
 </ul>
 
-<h2 id="bench">1. 测试数据</h2>
-<p>按机器分组。当前一组：</p>
+<h2 id="bench"><span class="zh">1. 测试数据</span><span class="en">1. Benchmarks</span></h2>
+<p><span class="zh">按机器分组。当前一组：</span><span class="en">Grouped by machine. Current group:</span></p>
 <details>
-<summary><b>RTX 4090D 48 GB（PCIe 3.0）· EPYC 7642 · GLM-5.3-Flash Q4_K_M · 1M 上下文</b></summary>
+<summary><b>RTX 4090D 48 GB（PCIe 3.0）· EPYC 7642 · GLM-5.3-Flash Q4_K_M · 1M</b></summary>
 
-<h3>测试环境</h3>
+<h3><span class="zh">测试环境</span><span class="en">Environment</span></h3>
 <table>
-  <tr><th>项目</th><th>配置</th></tr>
+  <tr><th><span class="zh">项目</span><span class="en">Item</span></th><th><span class="zh">配置</span><span class="en">Configuration</span></th></tr>
   <tr><td>GPU</td><td>RTX 4090D 48 GB，PCIe 3.0</td></tr>
-  <tr><td>CPU / 内存</td><td>EPYC 7642（48 核），8 通道 DDR4-2133，实测约 100 GB/s</td></tr>
-  <tr><td>模型</td><td>GLM-5.3-Flash Uncensored Q4_K_M（179.7 GB，4.81 BPW）</td></tr>
-  <tr><td>推理形态</td><td>非专家权重与 KV（q8_0）驻 GPU；路由专家驻 CPU 内存；6 专家缓存槽/层</td></tr>
-  <tr><td>服务参数</td><td>上下文 1,048,576；batch 65,536；并发 1</td></tr>
+  <tr><td><span class="zh">CPU / 内存</span><span class="en">CPU / RAM</span></td><td><span class="zh">EPYC 7642（48 核），8 通道 DDR4-2133，实测约 100 GB/s</span><span class="en">EPYC 7642 (48 cores), 8-channel DDR4-2133, ~100 GB/s measured</span></td></tr>
+  <tr><td><span class="zh">模型</span><span class="en">Model</span></td><td><span class="zh">GLM-5.3-Flash Uncensored Q4_K_M（179.7 GB，4.81 BPW）——<a href="https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF">unsloth GGUF</a>（五分片 + mmproj）</span><span class="en">GLM-5.3-Flash Uncensored Q4_K_M (179.7 GB, 4.81 BPW) — <a href="https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF">unsloth GGUF</a> (five shards + mmproj)</span></td></tr>
+  <tr><td><span class="zh">推理形态</span><span class="en">Inference form</span></td><td><span class="zh">非专家权重与 KV（q8_0）驻 GPU；路由专家驻 CPU 内存；6 专家缓存槽/层</span><span class="en">Non-expert weights and KV (q8_0) on GPU; routed experts in CPU RAM; 6 expert-cache slots per layer</span></td></tr>
+  <tr><td><span class="zh">服务参数</span><span class="en">Server</span></td><td><span class="zh">上下文 1,048,576；batch 65,536；并发 1</span><span class="en">Context 1,048,576; batch 65,536; concurrency 1</span></td></tr>
 </table>
 
-<h3>性能</h3>
-<p>完整阶梯测量，同一会话，每点输入后生成 128 token：</p>
+<h3><span class="zh">性能</span><span class="en">Performance</span></h3>
+<p><span class="zh">完整阶梯测量，同一会话，每点输入后生成 128 token：</span><span class="en">Full ladder, one session, 128 tokens generated per point:</span></p>
 <table>
-  <tr><th>输入长度 (token)</th><th class="num">Prefill (token/s)</th><th class="num">Decode (token/s)</th></tr>
+  <tr><th><span class="zh">输入长度 (token)</span><span class="en">Input length (tokens)</span></th><th class="num">Prefill (token/s)</th><th class="num">Decode (token/s)</th></tr>
   <tr><td class="num">64</td><td class="num">48.37</td><td class="num">16.08</td></tr>
   <tr><td class="num">256</td><td class="num">55.24</td><td class="num">16.07</td></tr>
   <tr><td class="num">1,024</td><td class="num">82.03</td><td class="num">15.02</td></tr>
@@ -90,113 +97,127 @@
   <tr><td class="num">65,536</td><td class="num">859.08</td><td class="num">14.94</td></tr>
   <tr><td class="num">262,144</td><td class="num">619.13</td><td class="num">17.63</td></tr>
 </table>
-<p>批大小 65,536 的设置依据：每趟流水线存在与 token 数无关的固定开销（激活专家权重的 PCIe 上传、CPU/GPU 调度边界），批越大摊得越薄——64 token 批 48 token/s，65,536 批 859 token/s。</p>
-<p>显存：1M 上下文全额预留（q8_0 KV）+ 专家缓存 + 视觉适配器，峰值 46.9 / 48 GB，且不随输入长度增长（69k–250k 实测恒定）。</p>
+<p><span class="zh">批大小 65,536 的设置依据：每趟流水线存在与 token 数无关的固定开销（激活专家权重的 PCIe 上传、CPU/GPU 调度边界），批越大摊得越薄——64 token 批 48 token/s，65,536 批 859 token/s。</span><span class="en">Why the 65,536-token batch: every pipeline pass pays fixed costs independent of token count (PCIe upload of the batch's activated expert weights, the CPU/GPU scheduling boundary); the larger the batch, the thinner they amortize — 48 token/s at a 64-token batch, 859 token/s at 65,536.</span></p>
+<p><span class="zh">显存：1M 上下文全额预留（q8_0 KV）+ 专家缓存 + 视觉适配器，峰值 46.9 / 48 GB，且不随输入长度增长（69k–250k 实测恒定）。</span><span class="en">VRAM: full 1M-context reservation (q8_0 KV) + expert cache + vision adapter peaks at 46.9 / 48 GB, independent of input length (measured flat from 69k to 250k).</span></p>
 
-<h3>启动命令</h3>
+<h3><span class="zh">启动命令</span><span class="en">Launch command</span></h3>
 <pre><code>env CUDA_VISIBLE_DEVICES=&lt;GPU UUID&gt; \
     GGML_SCHED_H2D_ASYNC=1 \
     LLAMA_MOE_CACHE_MAX_BATCH=512 \
     GGML_DSA_SCATTER_TILE=512 \
     ./build-release/bin/llama-server \
-    -m &lt;模型路径&gt;/GLM-5.3-Flash-Uncensored-Q4_K_M-00001-of-00005.gguf \
-    --mmproj &lt;模型路径&gt;/mmproj-GLM-5.3-Flash-Uncensored-F16.gguf \
+    -m &lt;model path&gt;/GLM-5.3-Flash-Uncensored-Q4_K_M-00001-of-00005.gguf \
+    --mmproj &lt;model path&gt;/mmproj-GLM-5.3-Flash-Uncensored-F16.gguf \
     -ngl 99 --cpu-moe --moe cache=6 -fa on -np 1 \
     -c 1048576 -ctk q8_0 -ctv q8_0 -t 48 -b 65536 -ub 65536 \
     --host 0.0.0.0 --port 8300 --alias glm53f --jinja</code></pre>
-<p>环境变量：<code>H2D_ASYNC</code> 为 CPU→GPU 输入异步拷贝；<code>MAX_BATCH=512</code> 使 ≤512 token 批走缓存专家就地路径；<code>SCATTER_TILE</code> 为 tiled scatter 分块大小。<code>cache=6</code> 为每层专家缓存槽数，是 48 GB 下的显存弹性项。</p>
+<p><span class="zh">环境变量：<code>H2D_ASYNC</code> 为 CPU→GPU 输入异步拷贝；<code>MAX_BATCH=512</code> 使 ≤512 token 批走缓存专家就地路径；<code>SCATTER_TILE</code> 为 tiled scatter 分块大小。<code>cache=6</code> 为每层专家缓存槽数，是 48 GB 下的显存弹性项。</span><span class="en">Environment variables: <code>H2D_ASYNC</code> enables async CPU→GPU input copies; <code>MAX_BATCH=512</code> lets batches of ≤512 tokens use in-place cached experts; <code>SCATTER_TILE</code> is the tiled-scatter tile size. <code>cache=6</code> is the per-layer expert-cache slot count — the VRAM elasticity knob at 48 GB.</span></p>
 
 </details>
 
-<h2 id="vram">2. 显存占用估算</h2>
-<p>显存 ≈ GPU 驻留权重 + KV 缓存 + KDA 循环状态 + 视觉适配器 + k16 转换缓存 + 专家缓存 + 计算池：</p>
+<h2 id="vram"><span class="zh">2. 显存占用估算</span><span class="en">2. VRAM estimation</span></h2>
+<p><span class="zh">显存 ≈ GPU 驻留权重 + KV 缓存 + KDA 循环状态 + 视觉适配器 + k16 转换缓存 + 专家缓存 + 计算池：</span><span class="en">VRAM ≈ GPU-resident weights + KV cache + KDA recurrent state + vision adapter + k16 conversion cache + expert cache + compute pool:</span></p>
 <table>
-  <tr><th>分项</th><th>决定参数</th><th>估算（Q4_K_M + q8_0 KV）</th></tr>
-  <tr><td>非专家权重</td><td>模型</td><td>8.7 GB（Q4_K_M）</td></tr>
-  <tr><td>KV 缓存</td><td>上下文（<code>-c</code>）</td><td>≈ 10 KiB/token（-ctk q8_0 -ctv q8_0）</td></tr>
-  <tr><td>KDA 循环状态</td><td>层数（常数）</td><td>0.15 GB</td></tr>
-  <tr><td>视觉</td><td>--mmproj</td><td>1.2 GB（f16 mmproj）</td></tr>
-  <tr><td>k16 转换缓存</td><td>上下文（<code>-c</code>）</td><td>≈ 1.45 KiB/token（仅量化 KV 时存在）</td></tr>
-  <tr><td>专家缓存</td><td>缓存槽数（<code>--moe cache=N</code>）</td><td>≈ 0.59 GB/槽（Q4_K_M）</td></tr>
-  <tr><td>计算池</td><td><code>-ub</code> 为主，弱 <code>-c</code> 项</td><td>≈ 0.28 MB/token × <code>-ub</code> + 1 KiB/token × <code>-c</code></td></tr>
-  <tr><td>其他</td><td>—</td><td>≈ 0.5 GB</td></tr>
+  <tr><th><span class="zh">分项</span><span class="en">Component</span></th><th><span class="zh">决定参数</span><span class="en">Decided by</span></th><th><span class="zh">估算（Q4_K_M + q8_0 KV）</span><span class="en">Estimate (Q4_K_M + q8_0 KV)</span></th></tr>
+  <tr><td><span class="zh">非专家权重</span><span class="en">Non-expert weights</span></td><td><span class="zh">模型</span><span class="en">model</span></td><td>8.7 GB（Q4_K_M）</td></tr>
+  <tr><td><span class="zh">KV 缓存</span><span class="en">KV cache</span></td><td><span class="zh">上下文（<code>-c</code>）</span><span class="en">context (<code>-c</code>)</span></td><td>≈ 10 KiB/token（-ctk q8_0 -ctv q8_0）</td></tr>
+  <tr><td><span class="zh">KDA 循环状态</span><span class="en">KDA recurrent state</span></td><td><span class="zh">层数（常数）</span><span class="en">layer count (constant)</span></td><td>0.15 GB</td></tr>
+  <tr><td><span class="zh">视觉</span><span class="en">Vision</span></td><td>--mmproj</td><td>1.2 GB（f16 mmproj）</td></tr>
+  <tr><td><span class="zh">k16 转换缓存</span><span class="en">k16 conversion cache</span></td><td><span class="zh">上下文（<code>-c</code>）</span><span class="en">context (<code>-c</code>)</span></td><td><span class="zh">≈ 1.45 KiB/token（仅量化 KV 时存在）</span><span class="en">≈ 1.45 KiB/token (exists only with quantized KV)</span></td></tr>
+  <tr><td><span class="zh">专家缓存</span><span class="en">Expert cache</span></td><td><span class="zh">缓存槽数（<code>--moe cache=N</code>）</span><span class="en">slot count (<code>--moe cache=N</code>)</span></td><td>≈ 0.59 GB/槽（Q4_K_M）</td></tr>
+  <tr><td><span class="zh">计算池</span><span class="en">Compute pool</span></td><td><span class="zh"><code>-ub</code> 为主，弱 <code>-c</code> 项</span><span class="en">mostly <code>-ub</code>, weak <code>-c</code> term</span></td><td>≈ 0.28 MB/token × <code>-ub</code> + 1 KiB/token × <code>-c</code></td></tr>
+  <tr><td><span class="zh">其他</span><span class="en">Other</span></td><td>—</td><td>≈ 0.5 GB</td></tr>
 </table>
-<p>显存不足时的调节：</p>
+<p><span class="zh">显存不足时的调节：</span><span class="en">When VRAM runs short, adjust in this order:</span></p>
 <ol>
-  <li><b>缓存槽数</b>（<code>--moe cache=N</code>）：降低影响 decode 速度</li>
-  <li><b>batch</b>（<code>-b</code>/<code>-ub</code>）：影响长单次输入 prefill 速度，4090+pcie3 推荐 16384，推荐值和算力正比、和 pcie 带宽反比</li>
-  <li><b>上下文</b>（<code>-c</code>）</li>
+  <li><span class="zh"><b>缓存槽数</b>（<code>--moe cache=N</code>）：降低影响 decode 速度</span><span class="en"><b>Cache slots</b> (<code>--moe cache=N</code>): lowering only affects decode speed</span></li>
+  <li><span class="zh"><b>batch</b>（<code>-b</code>/<code>-ub</code>）：影响长单次输入 prefill 速度，4090+pcie3 推荐 16384，推荐值和算力正比、和 pcie 带宽反比</span><span class="en"><b>Batch</b> (<code>-b</code>/<code>-ub</code>): affects long-single-input prefill speed; 16384 recommended on a 4090 + PCIe 3.0 — the recommended value scales with compute and inversely with PCIe bandwidth</span></li>
+  <li><span class="zh"><b>上下文</b>（<code>-c</code>）</span><span class="en"><b>Context</b> (<code>-c</code>)</span></li>
 </ol>
-<p>实测锚点：1M 上下文 + 6 槽 + 65,536 批 → 空闲 44.6 GB，满载峰值 46.9 GB。</p>
+<p><span class="zh">实测锚点：1M 上下文 + 6 槽 + 65,536 批 → 空闲 44.6 GB，满载峰值 46.9 GB。</span><span class="en">Measured anchors: 1M context + 6 slots + batch 65,536 → 44.6 GB idle, 46.9 GB peak.</span></p>
 
-<h2 id="routing">3. 路径路由</h2>
-<p>DSA 层按批次形状在三条执行路径间选择，与运行配置无关。两个阈值：</p>
+<h2 id="routing"><span class="zh">3. 路径路由</span><span class="en">3. Path routing</span></h2>
+<p><span class="zh">DSA 层按批次形状在三条执行路径间选择，与运行配置无关。两个阈值：</span><span class="en">The DSA layers pick one of three execution paths by batch shape alone, independent of configuration. Two thresholds:</span></p>
 <ul>
-  <li>选择窗口 n_sel = 2,051 cell（= 4 cell/池 × 512 池 + 3 尾格）；</li>
-  <li>分块大小 512 token。</li>
+  <li><span class="zh">选择窗口 n_sel = 2,051 cell（= 4 cell/池 × 512 池 + 3 尾格）；</span><span class="en">the selection window n_sel = 2,051 cells (= 4 cells/pool × 512 pools + 3 tail cells);</span></li>
+  <li><span class="zh">分块大小 512 token。</span><span class="en">the tile size of 512 tokens.</span></li>
 </ul>
 <table>
-  <tr><th>负载</th><th>已有上下文</th><th>路径</th><th>原因</th></tr>
-  <tr><td>prefill，&gt; 512 token</td><td>任意</td><td>tiled scatter</td><td>大批下 gather 需搬运 TB 级选中 latent；scatter 分块使掩码显存有界</td></tr>
-  <tr><td>prefill，≤ 512 token</td><td>≤ 2,051</td><td>单块 scatter</td><td>KV 画布小于选择窗口，直接散射开销最低</td></tr>
-  <tr><td>prefill，≤ 512 token</td><td>&gt; 2,051</td><td>gather，分块</td><td>选择窗口小于画布；分块约束显存</td></tr>
-  <tr><td>decode（1–16 token/步）</td><td>≤ 2,051</td><td>单块 scatter</td><td>同上</td></tr>
-  <tr><td>decode</td><td>&gt; 2,051</td><td>gather，单块</td><td>单步开销恒为 2,051 cell，与上下文长度无关</td></tr>
-  <tr><td>多序列 / 视觉（2d-rope）</td><td>任意</td><td>gather</td><td>scatter 路径仅支持单序列、一维位置</td></tr>
+  <tr><th><span class="zh">负载</span><span class="en">Workload</span></th><th><span class="zh">已有上下文</span><span class="en">Existing context</span></th><th><span class="zh">路径</span><span class="en">Path</span></th><th><span class="zh">原因</span><span class="en">Reason</span></th></tr>
+  <tr><td><span class="zh">prefill，&gt; 512 token</span><span class="en">prefill, &gt; 512 tokens</span></td><td><span class="zh">任意</span><span class="en">any</span></td><td>tiled scatter</td><td><span class="zh">大批下 gather 需搬运 TB 级选中 latent；scatter 分块使掩码显存有界</span><span class="en">at large batches gather must move TB-scale selected latents; scatter tiles keep mask memory bounded</span></td></tr>
+  <tr><td><span class="zh">prefill，≤ 512 token</span><span class="en">prefill, ≤ 512 tokens</span></td><td>≤ 2,051</td><td><span class="zh">单块 scatter</span><span class="en">monolithic scatter</span></td><td><span class="zh">KV 画布小于选择窗口，直接散射开销最低</span><span class="en">the KV canvas is smaller than the selection window — direct scatter is cheapest</span></td></tr>
+  <tr><td><span class="zh">prefill，≤ 512 token</span><span class="en">prefill, ≤ 512 tokens</span></td><td>&gt; 2,051</td><td><span class="zh">gather，分块</span><span class="en">gather, chunked</span></td><td><span class="zh">选择窗口小于画布；分块约束显存</span><span class="en">the selection window is now smaller than the canvas; chunking bounds memory</span></td></tr>
+  <tr><td><span class="zh">decode（1–16 token/步）</span><span class="en">decode (1–16 tokens/step)</span></td><td>≤ 2,051</td><td><span class="zh">单块 scatter</span><span class="en">monolithic scatter</span></td><td><span class="zh">同上</span><span class="en">same crossover</span></td></tr>
+  <tr><td>decode</td><td>&gt; 2,051</td><td><span class="zh">gather，单块</span><span class="en">gather, single chunk</span></td><td><span class="zh">单步开销恒为 2,051 cell，与上下文长度无关</span><span class="en">per-step cost pinned to 2,051 cells, independent of context length</span></td></tr>
+  <tr><td><span class="zh">多序列 / 视觉（2d-rope）</span><span class="en">multi-sequence / vision (2d-rope)</span></td><td><span class="zh">任意</span><span class="en">any</span></td><td>gather</td><td><span class="zh">scatter 路径仅支持单序列、一维位置</span><span class="en">the scatter forms support one sequence with 1d positions only</span></td></tr>
 </table>
-<p>索引打分在 池数 × token 数 &gt; 2<sup>24</sup> 时切换为（上下文块 × token 片）分块计算 + 滚动 top-k 归并，更小负载保持单块路径。该机制是 1M 上下文峰值显存恒定的直接原因。</p>
+<p><span class="zh">索引打分在 池数 × token 数 &gt; 2<sup>24</sup> 时切换为（上下文块 × token 片）分块计算 + 滚动 top-k 归并，更小负载保持单块路径。该机制是 1M 上下文峰值显存恒定的直接原因。</span><span class="en">Indexer scoring switches to (context-chunk × token-tile) blocks with a running top-k merge once pools × tokens &gt; 2<sup>24</sup>; smaller workloads keep the monolithic path. This mechanism is what keeps peak VRAM flat at 1M context.</span></p>
 
-<h2 id="opt">4. 优化内容</h2>
+<h2 id="opt"><span class="zh">4. 优化内容</span><span class="en">4. Optimizations</span></h2>
 
-<h3>4.1 上下文有界的选择内存</h3>
+<h3><span class="zh">4.1 上下文有界的选择内存</span><span class="en">4.1 Context-bounded selection memory</span></h3>
 <ul>
-  <li><b>索引打分分块</b>：得分按（上下文块 × token 片）计算，滚动 top-k 归并；乘积门控让小负载保持单块路径。选择阶段峰值显存不再随 上下文 × 批 增长——1M 预留下 69k–250k 输入实测恒定，单块路径在 1M 外推 93 GB。</li>
-  <li><b>逐 token 可见计数</b>：以每 token 可见池计数向量取代 [池数 × token 数] 的稠密因果掩码输入，块掩码由 GPU 现算；消除 1M 上下文下数百 GB 的宿主侧掩码输入及其 GPU 副本。</li>
-  <li><b>融合掩码块</b>：单趟 GPU 核将因果掩码块直写为注意力布局，取代约 10 算子的张量链，掩码数据量 6 → 1 KB/token。</li>
+  <li><span class="zh"><b>索引打分分块</b>：得分按（上下文块 × token 片）计算，滚动 top-k 归并；乘积门控让小负载保持单块路径。选择阶段峰值显存不再随 上下文 × 批 增长——1M 预留下 69k–250k 输入实测恒定，单块路径在 1M 外推 93 GB。</span><span class="en"><b>Chunked indexer scoring</b>: scores are computed in (context-chunk × token-tile) blocks with a running top-k merge; a product gate keeps small workloads on the monolithic path. Selection-stage peak memory stops growing with context × batch — measured flat from 69k to 250k inputs at full 1M reservation; the monolithic path extrapolates to 93 GB at 1M.</span></li>
+  <li><span class="zh"><b>逐 token 可见计数</b>：以每 token 可见池计数向量取代 [池数 × token 数] 的稠密因果掩码输入，块掩码由 GPU 现算；消除 1M 上下文下数百 GB 的宿主侧掩码输入及其 GPU 副本。</span><span class="en"><b>Per-token visibility counts</b>: the dense [pools × tokens] causal-mask input becomes a per-token visible-pool count vector, with chunk masks computed on the GPU; removes hundreds of GB of host-side mask input and its GPU copies at 1M context.</span></li>
+  <li><span class="zh"><b>融合掩码块</b>：单趟 GPU 核将因果掩码块直写为注意力布局，取代约 10 算子的张量链，掩码数据量 6 → 1 KB/token。</span><span class="en"><b>Fused mask blocks</b>: a single GPU pass writes the causal mask block directly in the attention layout, replacing a ~10-op tensor chain; mask traffic 6 → 1 KB/token.</span></li>
 </ul>
 
-<h3>4.2 Prefill 吞吐</h3>
+<h3><span class="zh">4.2 Prefill 吞吐</span><span class="en">4.2 Prefill throughput</span></h3>
 <ul>
-  <li><b>token 分块 scatter</b>：大单序列批按 token 片执行 DSA 注意力——转储行映射索引、逐片稀疏 flash attention、逐片输出投影。绕开 gather 的 latent 搬运瓶颈：同卡 65k 批形下 gather 约 125 token/s，分块 scatter 643（关缓存）至 859（端到端）token/s。</li>
-  <li><b>全 KV 库 f16 转换缓存</b>：量化 KV → f16 转换按整个 KV 库缓存而非每批重转，每个满批减少约 90 GiB 冗余转换流量。</li>
+  <li><span class="zh"><b>token 分块 scatter</b>：大单序列批按 token 片执行 DSA 注意力——转储行映射索引、逐片稀疏 flash attention、逐片输出投影。绕开 gather 的 latent 搬运瓶颈：同卡 65k 批形下 gather 约 125 token/s，分块 scatter 643（关缓存）至 859（端到端）token/s。</span><span class="en"><b>Token-tiled scatter</b>: large single-sequence batches run DSA attention in token tiles — dump-row-mapped indices, per-tile sparse flash attention, per-tile output projection. Escapes the gather path's latent-copy wall: gather ≈ 125 token/s at the same 65k batch shape on this card, tiled scatter 643 (cache off) to 859 (end-to-end) token/s.</span></li>
+  <li><span class="zh"><b>全 KV 库 f16 转换缓存</b>：量化 KV → f16 转换按整个 KV 库缓存而非每批重转，每个满批减少约 90 GiB 冗余转换流量。</span><span class="en"><b>Whole-KV f16 conversion cache</b>: the quantized-KV → f16 conversion for flash attention is cached for the whole KV store instead of being redone per batch, removing ~90 GiB of redundant conversion traffic per full batch.</span></li>
 </ul>
 
-<h3>4.3 规模稳定性与确定性（64k → 262k+）</h3>
+<h3><span class="zh">4.3 规模稳定性与确定性（64k → 262k+）</span><span class="en">4.3 Scale stability and determinism (64k → 262k+)</span></h3>
 <ul>
-  <li><b>核分批发射</b>：token/KV 维度超过 CUDA 网格轴上限（65,535）的核分批发射；262k 全上下文批稳定运行，此前 53k+ 批触发 CUDA invalid argument。</li>
-  <li><b>分块两遍式专家 GEMM</b>：批量量化矩阵乘按共享内存上限分块、两遍式刷写；53k+ 批不再触发共享内存断言与刷写错位。</li>
-  <li><b>MMVQ/MMQ 网格防护</b>：批量输入 gridDim.z 溢出防护。上游级缺陷，任何模型在批量量化路径达此规模均会触发。</li>
-  <li><b>确定性 top-k</b>：默认走分段 argsort 路径，规避 CCCL &lt; 3.4.3 的 DeviceTopK 竞态（上游已确认）；选择结果逐次可复现。</li>
-  <li><b>跨后端选择一致性</b>：CPU/GPU 的 top-k 与 argsort 排序对齐，所有路径填充全部选择输入，图重分裂时恢复调度器绑定；分块与单块选择路径在任意规模下取值等价（250k 逐 token 验证）。</li>
-  <li><b>decode 逐 token 图复用</b>：图复用检查识别稀疏路径的 1 元素哑元掩码，消除长上下文 decode 每 token 整图重建的固定开销；10 → 14.6–17.6 token/s（4k–262k）。</li>
+  <li><span class="zh"><b>核分批发射</b>：token/KV 维度超过 CUDA 网格轴上限（65,535）的核分批发射；262k 全上下文批稳定运行，此前 53k+ 批触发 CUDA invalid argument。</span><span class="en"><b>Batched kernel launches</b> wherever a token or KV dimension rides a CUDA grid axis capped at 65,535 — 262k full-context batches run stable (previously 53k+ batches hit CUDA invalid argument).</span></li>
+  <li><span class="zh"><b>分块两遍式专家 GEMM</b>：批量量化矩阵乘按共享内存上限分块、两遍式刷写；53k+ 批不再触发共享内存断言与刷写错位。</span><span class="en"><b>Tiled two-pass batched expert GEMM</b> keeps per-call shared memory bounded — 53k+ batches no longer trip shared-memory assertions or flush misalignment.</span></li>
+  <li><span class="zh"><b>MMVQ/MMQ 网格防护</b>：批量输入 gridDim.z 溢出防护。上游级缺陷，任何模型在批量量化路径达此规模均会触发。</span><span class="en"><b>MMVQ/MMQ grid guard</b> against gridDim.z overflow on batched inputs — an upstream-level defect any model hits on batched quantized paths at these sizes.</span></li>
+  <li><span class="zh"><b>确定性 top-k</b>：默认走分段 argsort 路径，规避 CCCL &lt; 3.4.3 的 DeviceTopK 竞态（上游已确认）；选择结果逐次可复现。</span><span class="en"><b>Deterministic top-k</b>: defaults to the segmented-argsort path, avoiding the DeviceTopK race in CCCL &lt; 3.4.3 (acknowledged upstream); selection is reproducible run to run.</span></li>
+  <li><span class="zh"><b>跨后端选择一致性</b>：CPU/GPU 的 top-k 与 argsort 排序对齐，所有路径填充全部选择输入，图重分裂时恢复调度器绑定；分块与单块选择路径在任意规模下取值等价（250k 逐 token 验证）。</span><span class="en"><b>Cross-backend selection parity</b>: CPU and GPU top-k/argsort orderings are aligned, every selection input is filled on every path, and scheduler rebinding is restored when a graph re-splits — the chunked and monolithic selection paths are value-equivalent at any scale (verified token by token at 250k).</span></li>
+  <li><span class="zh"><b>decode 逐 token 图复用</b>：图复用检查识别稀疏路径的 1 元素哑元掩码，消除长上下文 decode 每 token 整图重建的固定开销；10 → 14.6–17.6 token/s（4k–262k）。</span><span class="en"><b>Per-token graph reuse in decode</b>: the graph-reuse check recognizes the sparse paths' 1-element dummy mask, removing the per-token full-graph rebuild fixed cost of long-context decode; 10 → 14.6–17.6 token/s (4k–262k).</span></li>
 </ul>
 
-<h3>4.4 MoE 混合流水线</h3>
+<h3><span class="zh">4.4 MoE 混合流水线</span><span class="en">4.4 MoE hybrid pipeline</span></h3>
 <ul>
-  <li><b>专家链按 token 分块</b>：路由专家计算链按 token 切分，解码规模激活不再占用整批缓冲；专家缓存与 65k 满批共存于 48 GB。</li>
-  <li><b>宿主权重每图全量拷贝</b>：多消费者共享的 CPU 驻留专家权重每图拷贝一次，分块执行始终读取完整权重，大批下无额外带宽代价。</li>
-  <li><b>准入控制 + 动态上传前瞻</b>（采纳自基线新线）：miss 专家须在 64 token 窗口内复现方可占槽，预测上传按实测链路带宽与层耗时定时；本机解码 14.9 → 15.5 token/s（+3.8%），短对话命中率 12% → 14%。</li>
-  <li><b>短批缓存阈值</b>：缓存专家就地路径的批上限由 31 提升至 512，消除短输入越过该线后约 9 token/s 的损失。</li>
+  <li><span class="zh"><b>专家链按 token 分块</b>：路由专家计算链按 token 切分，解码规模激活不再占用整批缓冲；专家缓存与 65k 满批共存于 48 GB。</span><span class="en"><b>Expert chain tiled by tokens</b>: decode-scale activations no longer occupy the full-batch buffer; the expert cache coexists with full 65k batches inside 48 GB.</span></li>
+  <li><span class="zh"><b>宿主权重每图全量拷贝</b>：多消费者共享的 CPU 驻留专家权重每图拷贝一次，分块执行始终读取完整权重，大批下无额外带宽代价。</span><span class="en"><b>One full copy per graph for host-resident expert weights</b> shared by several consumers: tiled execution always reads complete weights, with no bandwidth cost at these sizes.</span></li>
+  <li><span class="zh"><b>准入控制 + 动态上传前瞻</b>（采纳自基线新线）：miss 专家须在 64 token 窗口内复现方可占槽，预测上传按实测链路带宽与层耗时定时；本机解码 14.9 → 15.5 token/s（+3.8%），短对话命中率 12% → 14%。</span><span class="en"><b>Admission control + dynamic upload lookahead</b> (adopted from the base's newer line): a missed expert must recur within a 64-token window before taking a slot, and predicted uploads are timed by measured link bandwidth vs layer time; decode here 14.9 → 15.5 token/s (+3.8%), short-chat hit rate 12% → 14%.</span></li>
+  <li><span class="zh"><b>短批缓存阈值</b>：缓存专家就地路径的批上限由 31 提升至 512，消除短输入越过该线后约 9 token/s 的损失。</span><span class="en"><b>Short-batch cache threshold</b>: the in-place cached-expert batch limit raised from 31 to 512, removing the ~9 token/s loss short inputs suffered above that line.</span></li>
 </ul>
 
-<h3>4.5 兼容与工具</h3>
+<h3><span class="zh">4.5 兼容与工具</span><span class="en">4.5 Compatibility and tooling</span></h3>
 <ul>
-  <li><b>GGUF 兼容</b>：unsloth 系 GLM-5.3-Flash 量化发布（架构命名、KV 前缀、视觉适配器），五分片 Q4_K_M + mmproj 直接加载。</li>
-  <li><b>诊断工具</b>：逐节点产后读回转储、分配规划活性转储、逐请求缓存换入换出日志；仅显式开启时生效，约 1.5 倍减速。</li>
+  <li><span class="zh"><b>GGUF 兼容</b>：unsloth 系 GLM-5.3-Flash 量化发布（架构命名、KV 前缀、视觉适配器），五分片 Q4_K_M + mmproj 直接加载。</span><span class="en"><b>GGUF compatibility</b>: unsloth-family GLM-5.3-Flash quantized releases (architecture naming, KV prefixes, vision adapter) — the five-shard Q4_K_M + mmproj load directly.</span></li>
+  <li><span class="zh"><b>诊断工具</b>：逐节点产后读回转储、分配规划活性转储、逐请求缓存换入换出日志；仅显式开启时生效，约 1.5 倍减速。</span><span class="en"><b>Diagnostics</b>: per-node post-eval dumps, allocation-plan liveness dumps, per-request cache churn logs; active only when explicitly enabled (~1.5× slowdown).</span></li>
 </ul>
 
-<h2 id="baseline">5. 与基线的关系</h2>
+<h2 id="baseline"><span class="zh">5. 与基线的关系</span><span class="en">5. Relation to the baselines</span></h2>
 <table>
-  <tr><th>对比对象</th><th>基线状态</th><th>本分支</th></tr>
-  <tr><td>llama.cpp 上游</td><td>不支持 glm5-next 架构</td><td>经兼容层加载运行；混合推理与专家缓存基础设施来自 neurall fork；第 4 节全部为本分支工作</td></tr>
-  <tr><td>neurall fork</td><td>面向多卡 24 GB 级、≤ 64k 上下文（自述解码较上游 1.7–2.4 倍）</td><td>面向单卡 48 GB、1M 上下文、65k prefill 批、视觉输入；新增 tiled scatter、有界选择内存、262k 级稳定性、确定性 top-k、跨后端一致性、GGUF 兼容；采纳基线新线的缓存调度，保留旧旋钮命名</td></tr>
+  <tr><th><span class="zh">对比对象</span><span class="en">Compared with</span></th><th><span class="zh">基线状态</span><span class="en">Baseline state</span></th><th><span class="zh">本分支</span><span class="en">This branch</span></th></tr>
+  <tr><td><span class="zh">llama.cpp 上游</span><span class="en">llama.cpp upstream</span></td><td><span class="zh">不支持 glm5-next 架构</span><span class="en">no glm5-next architecture support</span></td><td><span class="zh">经兼容层加载运行；混合推理与专家缓存基础设施来自 neurall fork；第 4 节全部为本分支工作</span><span class="en">loads and runs via the compatibility layer; the hybrid-inference and expert-cache infrastructure comes from the neurall fork; everything in section 4 is this branch's work</span></td></tr>
+  <tr><td>neurall fork</td><td><span class="zh">面向多卡 24 GB 级、≤ 64k 上下文（自述解码较上游 1.7–2.4 倍）</span><span class="en">targets multi-GPU 24 GB-class rigs at ≤ 64k contexts (its own headline: 1.7–2.4× decode vs upstream)</span></td><td><span class="zh">面向单卡 48 GB、1M 上下文、65k prefill 批、视觉输入；新增 tiled scatter、有界选择内存、262k 级稳定性、确定性 top-k、跨后端一致性、GGUF 兼容；采纳基线新线的缓存调度，保留旧旋钮命名</span><span class="en">targets a single 48 GB card at 1M context with 65k prefill batches and vision input; adds tiled scatter, bounded selection memory, 262k-scale stability, deterministic top-k, cross-backend parity, GGUF compatibility; adopts the base's newer cache scheduling while keeping the older knob names</span></td></tr>
 </table>
 
 <div class="footer">
-  <a href="https://github.com/Xxianna/llama.cpp">Xxianna/llama.cpp</a> · release 分支 ·
-  本页与仓库 README 中文部分同步维护（<code>docs/index.html</code>） · <a href="#top">回到顶部 ↑</a>
+  <a href="https://github.com/Xxianna/llama.cpp-glm-fast">Xxianna/llama.cpp</a> · release ·
+  <span class="zh">本页与仓库 README 中文部分同步维护（<code>docs/index.html</code>）</span><span class="en">This page mirrors the Chinese section of the repository README (<code>docs/index.html</code>)</span> · <a href="#top"><span class="zh">回到顶部 ↑</span><span class="en">Back to top ↑</span></a>
 </div>
 
 </div>
+<script>
+(function () {
+  var root = document.documentElement;
+  function set(en) {
+    root.classList.toggle('lang-en', en);
+    root.lang = en ? 'en' : 'zh-CN';
+    try { localStorage.setItem('lang', en ? 'en' : 'zh'); } catch (e) {}
+  }
+  try { set(localStorage.getItem('lang') === 'en'); } catch (e) {}
+  document.getElementById('lang-toggle').addEventListener('click', function () {
+    set(!root.classList.contains('lang-en'));
+  });
+})();
+</script>
 </body>
 </html>
