@@ -7,9 +7,10 @@
 **English (default)** · **[切换到中文版 →](#cn)**
 
 This branch of the fork runs **GLM-5.3-Flash** — a 180 GB Q4_K_M mixture-of-experts model with 288 experts per layer and
-hybrid linear (KDA) + sparse-indexed (DSA) attention — with a **1,048,576-token context**, **full 65,536-token
-micro-batches**, the **live expert cache** and the **vision adapter**, on a **single 48 GB GPU** backed by CPU RAM,
-with output correctness verified up to 250k-token prompts. At the fork point this configuration did not fit at any
+hybrid linear (KDA) + sparse-indexed (DSA) attention — with a **1,048,576-token context**, the **live expert cache** and
+the **vision adapter**, on a **single 48 GB GPU** backed by CPU RAM, with output correctness verified up to 250k-token
+prompts. Prefill is batched at 65,536 tokens **as a throughput device for long inputs, not as a setting in itself**
+(see "Why big prefill batches" below); decode runs its natural 1–16-token batches. At the fork point this configuration did not fit at any
 context: selection-scoring memory grew with context x batch (extrapolated ~93 GB at 1M), and 53k+ token batches hit
 launch-limit crashes.
 
@@ -26,11 +27,19 @@ experts in system RAM) · 1M context reserved with q8_0 KV. Rows marked ◆ were
 | prompt processing, full 65k batch ◆ | — | **468 t/s (53k chunk)** |
 | prompt processing, 69k–250k-token prompts, 6 cache slots | — | **358–433 t/s, output correct** (diagnostics on) |
 | decode, short chat (6 cache slots) | 14.9 t/s (same protocol) | **15.5 t/s (+3.8%)** |
+| decode, long context (4k–262k tokens) | 10 t/s, flat (cliff past ~2k ctx) | **14.4–16.3 t/s** |
 | decode, short chat ◆ (29 cache slots) | — | **17.6 t/s** |
 | correctness | — | sanity arithmetic + verifiable recall at 69k / 125k / 138k / 179k / 250k, all coherent |
 
-The decode row is a measured A/B (same protocol, temperature 0, 3–4 runs); the base column otherwise describes what the
+The decode rows are measured A/Bs (same protocol, temperature 0); the base column otherwise describes what the
 fork base does at these scales — it cannot complete these runs, so those cells are states, not benchmarks.
+
+**Why big prefill batches.** With the experts in RAM, every pipeline pass pays the same fixed costs regardless of how
+many tokens it carries: uploading the batch's activated expert weights over PCIe and crossing the CPU/GPU scheduling
+boundary. At 4k-token batches those round trips dominate the pass (147 t/s); at 65k the identical uploads amortize
+over 16x more tokens and the PCIe stream stays continuously overlapped with compute (468–711 t/s). Long inputs are
+exactly where this matters — hence the 65,536-token prefill batch. Decode never pays this cost: it runs 1–16-token
+batches against the expert cache, and its per-token work is independent of the batch size chosen for prefill.
 
 ## The optimizations
 
@@ -62,6 +71,11 @@ fork base does at these scales — it cannot complete these runs, so those cells
 - *Cross-backend selection parity.* CPU and GPU top-k/argsort orderings are made identical, every selection input is
   filled on every path, and scheduler rebinding is restored when a graph re-splits — the chunked and monolithic
   selection paths are value-equivalent at any scale (verified at the token level at 250k).
+- *Graph reuse across decode tokens.* The sparse-attention paths replace the causal-mask input with a 1-element dummy;
+  the graph-reuse check compared that dummy against the context size, failed on every token, and forced a full graph
+  rebuild and CUDA-graph re-capture per token — a fixed ~40% decode tax at any context past ~2k tokens (15 → 10 t/s,
+  flat to 262k). The check now recognizes the dummy, and decode-sized gathers take the single-chunk form again.
+  Long-context decode: **10 → 14.4 t/s (4k ctx), 16.3 t/s (69k ctx)** — no cliff at any scale.
 
 **D. The MoE pipeline on one card.**
 - *Expert-chain tiling by tokens* keeps decode-scale activations from blowing the compute buffer, so the expert cache
@@ -88,7 +102,7 @@ cache, placement and self-tuning come from the neurall fork. Everything in secti
 ## vs the neurall fork (base)
 
 The base targets multi-GPU 24 GB-class rigs at ≤64k contexts (its own headline: 1.7–2.4x decode vs upstream). This
-line targets **one 48 GB card at 1M context with full 65,536-token batches and vision**, adding the tiled-scatter
+line targets **one 48 GB card at 1M context, 65k-token prefill batching and vision**, adding the tiled-scatter
 prefill path, context-bounded selection memory, 262k-scale launch fixes, deterministic top-k and cross-backend
 selection parity, GLM-5.3-Flash GGUF compatibility — and it adopts the base's newer cache scheduling
 (admission/lookahead) while keeping the older knob names.
@@ -102,8 +116,9 @@ selection parity, GLM-5.3-Flash GGUF compatibility — and it adopts the base's 
 **[→ English version](#dev-glm53f)** · **中文**
 
 本分支在**单张 48 GB GPU + 内存后备**上运行 **GLM-5.3-Flash**（180 GB Q4_K_M 混合专家模型，每层 288 专家，
-KDA 线性注意力 + DSA 稀疏索引注意力混合）：**1,048,576 上下文**、**满 65,536 微批**、**专家缓存**与**视觉适配器**
-同时开启，输出正确性已验证到 250k token。切出基线 fork 时该配置任何上下文都装不下：选择/打分内存随
+KDA 线性注意力 + DSA 稀疏索引注意力混合）：**1,048,576 上下文**、**专家缓存**与**视觉适配器**同时开启，
+输出正确性已验证到 250k token。prefill 采用 65,536 大批**是长输入吞吐的手段，不是目的本身**
+（见下文"为什么要大 prefill 批"）；decode 走它天然的 1–16 token 小批。切出基线 fork 时该配置任何上下文都装不下：选择/打分内存随
 上下文×批增长（1M 外推约 93 GB），53k+ 批触发启动上限崩溃。
 
 ## 实测速度
@@ -119,11 +134,18 @@ KDA 线性注意力 + DSA 稀疏索引注意力混合）：**1,048,576 上下文
 | 长文处理，65k 满批 ◆ | — | **468 t/s（53k 分块）** |
 | 长文处理，69k–250k 长文，6 缓存槽 | — | **358–433 t/s，输出正确**（诊断开启） |
 | 解码，短对话（6 缓存槽） | 14.9 t/s（同协议） | **15.5 t/s（+3.8%）** |
+| 解码，长上下文（4k–262k token） | 10 t/s 恒定（~2k 后断崖） | **14.4–16.3 t/s** |
 | 解码，短对话 ◆（29 缓存槽） | — | **17.6 t/s** |
 | 正确性 | — | 算术 sanity + 69k/125k/138k/179k/250k 长文可核验复述，全部连贯 |
 
-解码行为实测 A/B（同协议、temperature 0、各 3–4 轮）；"基线"列其余格描述的是基线在此规模下的状态——
+解码行为实测 A/B（同协议、temperature 0）；"基线"列其余格描述的是基线在此规模下的状态——
 它无法完成这些运行，故不是同表基准。
+
+**为什么要大 prefill 批。** 专家驻内存时，每个流水趟次的固定成本与带多少 token 无关：把该批激活的专家
+权重经 PCIe 上传、跨一次 CPU/GPU 调度边界。4k 批时这些往返主导整个趟次（147 t/s）；65k 批时同样的上传
+摊到 16 倍的 token 上，PCIe 数据流与计算持续重叠（468–711 t/s）。长输入正是收益所在——这就是 65,536
+prefill 批存在的原因。decode 不付这份成本：它对专家缓存跑 1–16 token 小批，每 token 的工作量与 prefill
+批大小无关。
 
 ## 优化内容
 
@@ -148,6 +170,10 @@ KDA 线性注意力 + DSA 稀疏索引注意力混合）：**1,048,576 上下文
 - *默认确定性 top-k*（分段 argsort）：CCCL<3.4.3 的 DeviceTopK 快速路存在竞态（上游已确认）。选择逐次可复现。
 - *跨后端选择一致性*：CPU/GPU top-k/argsort 排序对齐、所有路径都填充选择输入、图重分裂时调度器绑定还原——
   分块路与单块路在任何规模下取值等价（250k 处逐 token 验证）。
+- *decode 逐 token 图复用*：稀疏注意力路径把因果掩码输入换成 1 元素哑元，而图复用检查拿哑元与上下文长度
+  比较，每 token 必假 → 每个 token 整图重建 + CUDA graph 重捕获——一个与上下文无关的 ~40% decode 固定税
+  （15 → 10 t/s，到 262k 恒定）。检查现在识别哑元，decode 尺寸的 gather 也恢复单块形态。
+  长上下文 decode：**10 → 14.4 t/s（4k ctx）、16.3 t/s（69k ctx）**——任何规模无断崖。
 
 **D. 单卡 MoE 流水线。**
 - *专家链按 token 分块*：解码规模激活不再撑爆计算缓冲，专家缓存与满 65k 批在 48 GB 内共存。
@@ -169,7 +195,7 @@ glm5-next / GLM-5.3-Flash 在切点时上游不支持。CPU/GPU 混合 MoE 服�
 ## 与 neurall fork（基线）的区别
 
 基线面向多卡 24 GB 级机器、≤64k 上下文（其自述：解码较上游 1.7–2.4×）。本分支面向**单张 48 GB 卡、1M 上下文、
-满 65,536 微批 + 视觉**，新增分块 scatter 长文路径、上下文有界的选择内存、262k 级发射修复、确定性 top-k 与
+65k 大批 prefill + 视觉**，新增分块 scatter 长文路径、上下文有界的选择内存、262k 级发射修复、确定性 top-k 与
 跨后端选择一致性、GLM-5.3-Flash GGUF 兼容；同时采纳基线新线的缓存调度（准入/前瞻），保留旧旋钮命名。
 
 ---
