@@ -16,30 +16,55 @@ launch-limit crashes.
 
 ## How fast
 
-Machine E: RTX 4090D 48 GB · EPYC 7642 (48 cores, ~100 GB/s RAM, ~6 GB/s PCIe) · GLM-5.3-Flash Q4_K_M (179.7 GB,
-experts in system RAM) · 1M context reserved with q8_0 KV. Rows marked ◆ were measured on the companion 64 GB
-(CMP 170HX) card with 29 cache slots; all other rows are machine E with 6 slots.
+One machine: **RTX 4090D 48 GB on PCIe 3.0** · EPYC 7642, 8× DDR4-2133 (~100 GB/s) · GLM-5.3-Flash Q4_K_M
+(179.7 GB, experts in system RAM) · 1M context reserved with q8_0 KV · 6 expert-cache slots · concurrency 1.
+Full ladder, one session, 128 generated tokens per point:
 
-| test | fork base at this scale | this branch |
-|---|---|---|
-| 1M context + 65,536-token batches + cache + vision | does not fit (selection memory ~93 GB extrapolated) | **runs; peak 46.8 / 48 GB** |
-| prompt processing, full 65k batch, no expert cache | crashes at ≥53k batches | **643 t/s** |
-| prompt processing, full 65k batch ◆ | — | **468 t/s (53k chunk)** |
-| prompt processing, 69k–250k-token prompts, 6 cache slots | — | **358–433 t/s, output correct** (diagnostics on) |
-| decode, short chat (6 cache slots) | 14.9 t/s (same protocol) | **15.5 t/s (+3.8%)** |
-| decode, long context (4k–262k tokens) | 10 t/s, flat (cliff past ~2k ctx) | **14.4–16.3 t/s** |
-| decode, short chat ◆ (29 cache slots) | — | **17.6 t/s** |
-| correctness | — | sanity arithmetic + verifiable recall at 69k / 125k / 138k / 179k / 250k, all coherent |
+| prompt (tokens) | prefill (ms) | prefill (t/s) | output (tokens) | output (ms) | output (t/s) |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 1323.16 | 48.37 | 128 | 7960.47 | 16.08 |
+| 256 | 4634.11 | 55.24 | 128 | 7966.66 | 16.07 |
+| 1024 | 12483.13 | 82.03 | 128 | 8524.37 | 15.02 |
+| 4096 | 15075.61 | 271.70 | 128 | 8745.72 | 14.64 |
+| 16384 | 27554.56 | 594.60 | 128 | 8239.76 | 15.53 |
+| 65536 | 76286.40 | 859.08 | 128 | 8566.24 | 14.94 |
+| 262144 | 423405.21 | 619.13 | 128 | 7262.20 | 17.63 |
 
-The decode rows are measured A/Bs (same protocol, temperature 0); the base column otherwise describes what the
-fork base does at these scales — it cannot complete these runs, so those cells are states, not benchmarks.
+Read it as: prefill climbs with the batch size as the fixed per-pass costs amortize, peaking at the full 65,536-token
+batch (859 t/s); 262k spans four batches and settles at 619 t/s as the per-batch selection state grows with the
+context. Decode is **flat 14.6–17.6 t/s across the whole ladder — 262k included (17.6)** after the graph-reuse fix
+below; before it, a fixed 10 t/s cliff started past ~2k context.
+
+Same machine, supporting measurements: full 65k batch with the expert cache off — 643 t/s; the cache-scheduling
+adoption (admission + lookahead) A/B — decode 14.9 → 15.5 t/s; peak VRAM 46.9 / 48 GB with 1M context, q8_0 KV, the
+cache and the vision adapter all reserved; correctness — sanity arithmetic plus verifiable recall at
+69k / 125k / 138k / 179k / 250k tokens, all coherent. At the fork point none of this ran: selection memory
+extrapolated to ~93 GB at 1M and 53k+ batches crashed.
 
 **Why big prefill batches.** With the experts in RAM, every pipeline pass pays the same fixed costs regardless of how
 many tokens it carries: uploading the batch's activated expert weights over PCIe and crossing the CPU/GPU scheduling
-boundary. At 4k-token batches those round trips dominate the pass (147 t/s); at 65k the identical uploads amortize
-over 16x more tokens and the PCIe stream stays continuously overlapped with compute (468–711 t/s). Long inputs are
-exactly where this matters — hence the 65,536-token prefill batch. Decode never pays this cost: it runs 1–16-token
-batches against the expert cache, and its per-token work is independent of the batch size chosen for prefill.
+boundary. At 64–256-token batches those round trips dominate the whole pass (48–55 t/s); at 4k they still weigh
+(272 t/s); at 65k the identical uploads amortize over 16x more tokens and the PCIe stream stays continuously
+overlapped with compute (859 t/s). Long inputs are exactly where this matters — hence the 65,536-token prefill
+batch. Decode never pays this cost: it runs 1–16-token batches against the expert cache, and its per-token work is
+independent of the batch size chosen for prefill.
+
+## Which path runs when
+
+The sparse-attention layers switch between three execution paths by shape, not by configuration. The crossover is
+the selection window (2,051 rows = indexer top-k × pool size); the tile size is 512 tokens.
+
+| existing context | new input | path | why |
+|---|---|---|---|
+| ≤ ~2k | decode (1–16 tokens) or small batch | monolithic scatter | the KV canvas is still smaller than the 2,051-row selection — scattering is the least work |
+| > ~2k | decode (1–16 tokens) | gather, single chunk | per-token work pinned to the 2,051 selected rows; a canvas would grow with context |
+| > ~2k | small batch ≤ 512 tokens (follow-up turns) | gather, chunked | same crossover; chunking bounds the gather's memory |
+| any | batch > 512 tokens, single sequence | token-tiled scatter | at big batches the gather's latent copies are a bandwidth wall; tiles keep mask memory bounded |
+| any | multi-sequence / 2d-rope (vision) | gather | the scatter tiles assume one sequence with 1d positions |
+
+Selection scoring itself splits into (context-chunk × token-tile) blocks with a running top-k merge once
+pools × tokens exceeds ~2^24 — that is what keeps peak memory flat at any context; smaller workloads keep the
+monolithic scoring path.
 
 ## The optimizations
 
@@ -55,10 +80,10 @@ batches against the expert cache, and its per-token work is independent of the b
 **B. Prefill throughput: token-tiled sparse scatter.**
 - *Tiled scatter attention.* Large single-sequence batches run the DSA attention in token tiles — dump-mapped indices,
   per-tile sparse flash attention, per-tile output projection. This escapes the gather path's latent-copy bandwidth
-  wall: **468 t/s vs 158 t/s (2.9x)** on the same 53k chunk, and full 65k batches at **643 t/s** with the conversion
-  cache below.
+  wall: the gather alternative measures ~125 t/s at these batch shapes on this card, the tiled scatter **643 t/s**
+  with the cache off and **859 t/s** end-to-end at the full 65k batch (table above).
 - *Whole-KV f16 conversion cache.* The quantized-KV → f16 conversion for flash attention is cached for the whole KV
-  store instead of redone per batch, removing ~90 GiB of redundant conversion traffic per batch: **468 → 643 t/s (+37%)**.
+  store instead of redone per batch, removing ~90 GiB of redundant conversion traffic per full batch.
 
 **C. Scale stability and determinism (64k → 262k+).**
 - *Batched kernel launches* wherever a token or KV dimension rides a CUDA grid axis that caps at 65,535 — 262k-token
@@ -75,7 +100,7 @@ batches against the expert cache, and its per-token work is independent of the b
   the graph-reuse check compared that dummy against the context size, failed on every token, and forced a full graph
   rebuild and CUDA-graph re-capture per token — a fixed ~40% decode tax at any context past ~2k tokens (15 → 10 t/s,
   flat to 262k). The check now recognizes the dummy, and decode-sized gathers take the single-chunk form again.
-  Long-context decode: **10 → 14.4 t/s (4k ctx), 16.3 t/s (69k ctx)** — no cliff at any scale.
+  Long-context decode: **10 → 14.6–17.6 t/s across 4k–262k context** (full ladder above) — no cliff at any scale.
 
 **D. The MoE pipeline on one card.**
 - *Expert-chain tiling by tokens* keeps decode-scale activations from blowing the compute buffer, so the expert cache
@@ -123,29 +148,49 @@ KDA 线性注意力 + DSA 稀疏索引注意力混合）：**1,048,576 上下文
 
 ## 实测速度
 
-机器 E：RTX 4090D 48 GB · EPYC 7642（48 核，内存 ~100 GB/s，PCIe ~6 GB/s）· GLM-5.3-Flash Q4_K_M（179.7 GB，
-专家驻内存）· 1M 上下文全额预留 + q8_0 KV。带 ◆ 的行在配套 64 GB 卡（CMP 170HX、29 缓存槽）上测得；
-其余为机器 E、6 缓存槽。
+单一机器：**RTX 4090D 48 GB（PCIe 3.0）** · EPYC 7642，8× DDR4-2133（~100 GB/s）· GLM-5.3-Flash Q4_K_M
+（179.7 GB，专家驻内存）· 1M 上下文全额预留 + q8_0 KV · 6 专家缓存槽 · 并发数 1。
+完整阶梯，同一会话，每点生成 128 token：
 
-| 测试 | 基线 fork 在此规模 | 本分支 |
-|---|---|---|
-| 1M 上下文 + 65,536 微批 + 缓存 + 视觉 | 装不下（选择内存外推 ~93 GB） | **可跑；峰值 46.8 / 48 GB** |
-| 长文处理，65k 满批，无专家缓存 | ≥53k 批崩溃 | **643 t/s** |
-| 长文处理，65k 满批 ◆ | — | **468 t/s（53k 分块）** |
-| 长文处理，69k–250k 长文，6 缓存槽 | — | **358–433 t/s，输出正确**（诊断开启） |
-| 解码，短对话（6 缓存槽） | 14.9 t/s（同协议） | **15.5 t/s（+3.8%）** |
-| 解码，长上下文（4k–262k token） | 10 t/s 恒定（~2k 后断崖） | **14.4–16.3 t/s** |
-| 解码，短对话 ◆（29 缓存槽） | — | **17.6 t/s** |
-| 正确性 | — | 算术 sanity + 69k/125k/138k/179k/250k 长文可核验复述，全部连贯 |
+| 提示词长度 (tokens) | 预填充耗时 (ms) | 预填充速度 (t/s) | 输出长度 (tokens) | 输出耗时 (ms) | 输出速度 (t/s) |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 1323.16 | 48.37 | 128 | 7960.47 | 16.08 |
+| 256 | 4634.11 | 55.24 | 128 | 7966.66 | 16.07 |
+| 1024 | 12483.13 | 82.03 | 128 | 8524.37 | 15.02 |
+| 4096 | 15075.61 | 271.70 | 128 | 8745.72 | 14.64 |
+| 16384 | 27554.56 | 594.60 | 128 | 8239.76 | 15.53 |
+| 65536 | 76286.40 | 859.08 | 128 | 8566.24 | 14.94 |
+| 262144 | 423405.21 | 619.13 | 128 | 7262.20 | 17.63 |
 
-解码行为实测 A/B（同协议、temperature 0）；"基线"列其余格描述的是基线在此规模下的状态——
-它无法完成这些运行，故不是同表基准。
+读法：prefill 随批增大摊薄固定成本而爬升，满 65,536 批达峰（859 t/s）；262k 跨四个批，随每批选择状态
+随上下文增长而回落到 619 t/s。decode **全阶梯平坦 14.6–17.6 t/s——含 262k（17.6）**，这是下文图复用修复
+之后；修复前从 ~2k 上下文起恒定 10 t/s 断崖。
+
+同机补充测量：满 65k 批关专家缓存——643 t/s；缓存调度采纳（准入+前瞻）A/B——decode 14.9 → 15.5 t/s；
+1M 上下文 + q8_0 KV + 缓存 + 视觉适配器全预留峰值显存 46.9 / 48 GB；正确性——算术 sanity +
+69k/125k/138k/179k/250k 可核验复述全部连贯。切点时以上全部跑不起来：选择内存 1M 外推 ~93 GB、53k+ 批崩溃。
 
 **为什么要大 prefill 批。** 专家驻内存时，每个流水趟次的固定成本与带多少 token 无关：把该批激活的专家
-权重经 PCIe 上传、跨一次 CPU/GPU 调度边界。4k 批时这些往返主导整个趟次（147 t/s）；65k 批时同样的上传
-摊到 16 倍的 token 上，PCIe 数据流与计算持续重叠（468–711 t/s）。长输入正是收益所在——这就是 65,536
-prefill 批存在的原因。decode 不付这份成本：它对专家缓存跑 1–16 token 小批，每 token 的工作量与 prefill
-批大小无关。
+权重经 PCIe 上传、跨一次 CPU/GPU 调度边界。64–256 批时这些往返主导整个趟次（48–55 t/s）；4k 批仍有分量
+（272 t/s）；65k 批时同样的上传摊到 16 倍的 token 上，PCIe 数据流与计算持续重叠（859 t/s）。长输入正是
+收益所在——这就是 65,536 prefill 批存在的原因。decode 不付这份成本：它对专家缓存跑 1–16 token 小批，
+每 token 的工作量与 prefill 批大小无关。
+
+## 路由：什么时候走哪条路
+
+稀疏注意力层在三条执行路径间按形状切换，而非按配置。交叉点是选择窗口（2,051 行 = 索引 top-k × 池大小）；
+分块大小 512 token。
+
+| 已有上下文 | 新输入 | 路径 | 理由 |
+|---|---|---|---|
+| ≤ ~2k | decode（1–16 token）或小批 | 单块 scatter | KV 画布仍小于 2,051 行的选择集——散射工作量最小 |
+| > ~2k | decode（1–16 token） | gather，单块 | 每 token 工作量钉在选中的 2,051 行；画布会随上下文增长 |
+| > ~2k | 小批 ≤ 512 token（追问轮次） | gather，分块 | 同一交叉点；分块约束 gather 显存 |
+| 任意 | 批 > 512 token，单序列 | token 分块 scatter | 大批下 gather 的 latent 拷贝是带宽墙；分块让掩码显存有界 |
+| 任意 | 多序列 / 2d-rope（视觉） | gather | scatter 分块假设单序列、1d 位置 |
+
+选择打分本身在 池数×token数 超过 ~2^24 后切换为（上下文块 × token 片）分块 + 滚动 top-k 归并——这就是
+任意上下文下峰值显存恒定的原因；更小的负载保持单块打分路径。
 
 ## 优化内容
 
@@ -159,9 +204,9 @@ prefill 批存在的原因。decode 不付这份成本：它对专家缓存跑 1
 
 **B. 长文吞吐：token 分块稀疏 scatter。**
 - *分块 scatter 注意力*：大单序列批按 token 片执行 DSA 注意力——转储行映射索引、逐片稀疏 flash attention、
-  逐片输出投影。绕开 gather 路的 latent 拷贝带宽墙：同一 53k 分块 **468 t/s 对 158 t/s（2.9×）**。
-- *全 KV 库 f16 转换缓存*：量化 KV→f16 转换按整个 KV 库缓存而非逐批重转，每批省 ~90 GiB 冗余转换流量：
-  **468 → 643 t/s（+37%）**。
+  逐片输出投影。绕开 gather 路的 latent 拷贝带宽墙：同卡同批形下 gather 替代路约 ~125 t/s，分块 scatter
+  关缓存 **643 t/s**、满 65k 批端到端 **859 t/s**（见上表）。
+- *全 KV 库 f16 转换缓存*：量化 KV→f16 转换按整个 KV 库缓存而非逐批重转，每个满批省 ~90 GiB 冗余转换流量。
 
 **C. 规模稳定性与确定性（64k → 262k+）。**
 - *核分批发射*：凡 token/KV 维度挂在 CUDA 网格轴（上限 65,535）的核一律分批——262k 全上下文批稳定运行。
@@ -173,7 +218,7 @@ prefill 批存在的原因。decode 不付这份成本：它对专家缓存跑 1
 - *decode 逐 token 图复用*：稀疏注意力路径把因果掩码输入换成 1 元素哑元，而图复用检查拿哑元与上下文长度
   比较，每 token 必假 → 每个 token 整图重建 + CUDA graph 重捕获——一个与上下文无关的 ~40% decode 固定税
   （15 → 10 t/s，到 262k 恒定）。检查现在识别哑元，decode 尺寸的 gather 也恢复单块形态。
-  长上下文 decode：**10 → 14.4 t/s（4k ctx）、16.3 t/s（69k ctx）**——任何规模无断崖。
+  长上下文 decode：**10 → 14.6–17.6 t/s（4k–262k 全阶梯，见上表）**——任何规模无断崖。
 
 **D. 单卡 MoE 流水线。**
 - *专家链按 token 分块*：解码规模激活不再撑爆计算缓冲，专家缓存与满 65k 批在 48 GB 内共存。
