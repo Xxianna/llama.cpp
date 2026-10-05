@@ -1059,16 +1059,16 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     for (int i = 0; i < graph->n_nodes; i++) {
         if (cur_split < sched->n_splits && i == sched->splits[cur_split].i_start) {
             ggml_backend_t split_backend = sched->backends[sched->splits[cur_split].backend_id];
-            GGML_LOG_DEBUG("\n## SPLIT #%d: %s # %d inputs", cur_split, ggml_backend_name(split_backend),
+            fprintf(stderr, "\n## SPLIT #%d: %s # %d inputs", cur_split, ggml_backend_name(split_backend),
                 sched->splits[cur_split].n_inputs);
             for (int j = 0; j < sched->splits[cur_split].n_inputs; j++) {
                 if (j == 0) {
-                    GGML_LOG_DEBUG(": ");
+                    fprintf(stderr, ": ");
                 }
-                GGML_LOG_DEBUG("[%s (%5.5s)] ", sched->splits[cur_split].inputs[j]->name,
+                fprintf(stderr, "[%s (%5.5s)] ", sched->splits[cur_split].inputs[j]->name,
                     fmt_size(ggml_nbytes(sched->splits[cur_split].inputs[j])));
             }
-            GGML_LOG_DEBUG("\n");
+            fprintf(stderr, "\n");
             cur_split++;
         }
         struct ggml_tensor * node = graph->nodes[i];
@@ -1077,7 +1077,7 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
         }
         if (sched->debug > 1) {
             ggml_backend_t tensor_backend = ggml_backend_sched_get_tensor_backend(sched, node);
-            GGML_LOG_DEBUG("node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d,c=%d:", i, ggml_op_desc(node), node->name,
+            fprintf(stderr, "node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d,c=%d:", i, ggml_op_desc(node), node->name,
                 fmt_size(ggml_nbytes(node)), tensor_backend ? ggml_backend_name(tensor_backend) : "NULL", GET_CAUSE(node),
                 graph->use_counts[ggml_hash_find(&graph->visited_hash_set, node)], node->flags & GGML_TENSOR_FLAG_COMPUTE ? 1 : 0);
             for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1089,7 +1089,7 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
                 GGML_LOG_DEBUG(" %20.20s (%5.5s) [%5.5s %8.8s]", src->name,
                     fmt_size(ggml_nbytes(src)), src_backend ? ggml_backend_name(src_backend) : "NULL", GET_CAUSE(src));
             }
-            GGML_LOG_DEBUG("\n");
+            fprintf(stderr, "\n");
         }
     }
 }

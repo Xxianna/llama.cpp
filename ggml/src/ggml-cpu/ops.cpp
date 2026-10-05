@@ -8706,12 +8706,16 @@ void ggml_compute_forward_timestep_embedding(
 template<enum ggml_sort_order order>
 struct cmp_argsort {
     const float * data;
+    // ties by ascending index for cross-backend parity with the CUDA argsort path
     bool operator()(int32_t a, int32_t b) const {
-        if constexpr (order == GGML_SORT_ORDER_ASC) {
-            return data[a] < data[b];
-        } else {
-            return data[a] > data[b];
+        if (data[a] != data[b]) {
+            if constexpr (order == GGML_SORT_ORDER_ASC) {
+                return data[a] < data[b];
+            } else {
+                return data[a] > data[b];
+            }
         }
+        return a < b;
     }
 };
 
@@ -8778,8 +8782,14 @@ void ggml_compute_forward_argsort(
 
 struct cmp_top_k {
     const float * data;
+    // ties by ascending index: the CUDA path (segmented argsort) is stable, and
+    // cross-backend parity matters -- a scheduler assignment flip between rebuilds
+    // of the same graph must not change the selected ids
     bool operator()(int32_t a, int32_t b) const {
-        return data[a] > data[b];
+        if (data[a] != data[b]) {
+            return data[a] > data[b];
+        }
+        return a < b;
     }
 };
 
@@ -8809,16 +8819,15 @@ static void ggml_compute_forward_top_k_f32(
             tmp[j] = j;
         }
 
-        std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{src_data});
+        // std::partial_sort is NOT stable: with the index-tiebreaking comparator it
+        // still reorders equal elements arbitrarily across runs/backends. A full
+        // stable sort guarantees the same ids in the same order as the CUDA path
+        // for identical input bytes.
+        std::stable_sort(tmp, tmp + ne00, cmp_top_k{src_data});
 
         int32_t * dst_data = (int32_t *)((char *) dst->data + i*nb1);
 
         std::copy(tmp, tmp + top_k, dst_data);
-
-        // emphasize that the order is not important
-        if (top_k > 1) {
-            std::swap(dst_data[0], dst_data[1]);
-        }
     }
 }
 

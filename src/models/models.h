@@ -2624,6 +2624,10 @@ struct llama_model_glm5_next : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // GGML_DSA_SEL_DUMP channel: the selection's pre-cast F32 ids of the most
+        // recent full-indexer layer (diagnostic only)
+        ggml_tensor * sel_dbg_f32 = nullptr;
+
         // layer boundary node indices for streaming execution (GGML_LAYER_STREAMING=1)
 
         // collapse the hc streams with per-stream weights
@@ -2666,7 +2670,8 @@ struct llama_model_glm5_next : public llama_model_base {
                                       int64_t d_inner, int64_t n_seq_tokens, int64_t n_seqs, int il);
 
         ggml_tensor * build_kpool_select(ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
-                                         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il);
+                                         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il,
+                                         std::vector<ggml_tensor *> * sel_liveness_extra = nullptr);
 
         ggml_tensor * build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
                                       const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
@@ -2730,6 +2735,7 @@ struct llama_model_step35 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
+
     };
 
     struct graph_mtp : public llm_graph_context {

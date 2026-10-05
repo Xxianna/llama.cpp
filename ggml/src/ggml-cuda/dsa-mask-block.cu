@@ -39,7 +39,8 @@ static __global__ void dsa_mask_block_kernel(
 // block 0 and a violation line from any block that sees a leak.
 static __global__ void dsa_mask_block_check_kernel(
         const int * __restrict__ sel, const float * __restrict__ nvis, const int nvis_off,
-        const int n_kv, const int n_sel, const size_t sel_nb1) {
+        const int n_kv, const int n_sel, const size_t sel_nb1,
+        const float * __restrict__ f32dbg) {
     const int t = blockIdx.x;
     const int * __restrict__ s = (const int *) ((const char *) sel + (size_t) t*sel_nb1);
     const int nv = (int) nvis[t + nvis_off];
@@ -68,6 +69,13 @@ static __global__ void dsa_mask_block_check_kernel(
         if (blockIdx.x == 0) {
             printf("dsamask t=0 nv=%d n_kv=%d n_sel=%d dump=%d range=[%d,%d] s0=%d s1=%d s2=%d\n",
                     nv, n_kv, n_sel, s_dump, s_mn, s_mx, s[0], s[1], s[2]);
+        }
+        if (f32dbg != nullptr && threadIdx.x == 0 && (s_leak > 0 || s_neg > 0 || blockIdx.x == 0)) {
+            // the pre-cast F32 ids for this column: NaN/huge => the ids were already
+            // garbage floats before the I32 cast; finite == cast => cast-side issue
+            printf("f32dbg t=%d f0=%g f1=%g f2=%g isnan=%d\n",
+                    t, f32dbg[(size_t) t], f32dbg[(size_t) t + 1] != 0 ? f32dbg[(size_t) t + 1] : 0.0f,
+                    0.0f, isnan(f32dbg[(size_t) t]));
         }
     }
 }
@@ -121,8 +129,10 @@ static void dsa_mask_block_f16(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         }
     }
     if (sel_dump && nvis != nullptr && nvis->buffer != nullptr) {
+        const ggml_tensor * f32dbg = dst->src[2];
         dsa_mask_block_check_kernel<<<blocks_num, block_dim, 0, stream>>>(
-                (const int *) sel->data, (const float *) nvis->data, nvis_off, n_kv, n_sel, sel->nb[1]);
+                (const int *) sel->data, (const float *) nvis->data, nvis_off, n_kv, n_sel, sel->nb[1],
+                (f32dbg != nullptr && f32dbg->buffer != nullptr) ? (const float *) f32dbg->data : nullptr);
     }
     CUDA_CHECK(cudaGetLastError());
 }

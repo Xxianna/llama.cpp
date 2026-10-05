@@ -1,4 +1,6 @@
 #include "models.h"
+#include "ggml-alloc.h"
+#include "../../ggml/src/ggml-impl.h"
 #include "llama-memory-hybrid-idx.h"
 
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
@@ -913,7 +915,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
 
 ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
-        const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il) {
+        const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il,
+        std::vector<ggml_tensor *> * sel_liveness_extra) {
 
     const auto * mctx_lid = mctx_hyb->get_idx();
 
@@ -1255,7 +1258,27 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         ggml_tensor * dump_r  = ggml_arange(ctx0, (float) n_kv, (float) (n_kv + n_sel), 1.0f);
         ggml_tensor * idx_r   = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
         idx_r = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_r, dump_r), live_r), dump_r);
+
+        // Liveness pins for the selection tail. The pre-mapping sel_idx's last in-graph
+        // consumer is the mapping's final cast; after that node the allocator frees its
+        // block and the mapping's own outputs (or later same-graph ops) recycle it --
+        // reading back recycled bytes (float/dump-row bit patterns) is the deterministic
+        // garbage at 3+ big ubatches. Verified minimal pin set (dev/demos
+        // kpool_chain_demo, full-fidelity 3-ubatch config): pre-mapping sel_idx, the
+        // mapping F32 before the final cast, and the final mapped I32.
+        ggml_tensor * idx_r_f32 = idx_r;
         idx_r = ggml_cast(ctx0, idx_r, GGML_TYPE_I32);
+
+        // the pre-mapping sel_idx and the mapping F32 are freed after their last in-graph
+        // consumer (the final cast) while the per-tile mask consumers below still read the
+        // lineage through later splits -- register them; the caller pins everything AFTER
+        // the last tile (pinning here would only extend life to this earlier position)
+        if (sel_liveness_extra != nullptr) {
+            sel_liveness_extra->push_back(sel_idx);
+            sel_liveness_extra->push_back(idx_r_f32);
+        }
+        sel_dbg_f32 = idx_r_f32; // GGML_DSA_SEL_DUMP: the pre-cast F32 ids
+
         cb(idx_r, "indexer_sel_idx_mapped", il);
         return idx_r;
     }
@@ -1324,6 +1347,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         const char * e = getenv("GGML_DSA_SCATTER_TILE");
         return e ? atoll(e) : 1024;
     }();
+    static const bool sel_pin_outputs = [] {
+        const char * e = getenv("GGML_DSA_SEL_UNPIN");
+        return !(e && atoi(e) != 0); // default on: pin selection tensors as graph outputs
+    }();
     const bool scatter_tiled = !inp_kpool->gather && scatter_tile_sz > 0
         && n_tokens > scatter_tile_sz && ubatch.n_seqs == 1 && !ubatch.is_pos_2d();
 
@@ -1344,13 +1371,45 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
 
     ggml_tensor * sel = nullptr;
+    std::vector<ggml_tensor *> sel_liveness; // selection-lineage tensors to pin after the tiles
     if (il >= (int) hparams.n_layer() || hparams.is_indexer_full(il)) { // the NextN block always has a full indexer
-        sel = build_kpool_select(cur, qr, kq_mask, layer, mctx_hyb, inp_kpool, il);
+        sel = build_kpool_select(cur, qr, kq_mask, layer, mctx_hyb, inp_kpool, il, &sel_liveness);
         *prev_sel = sel;
     } else {
         GGML_ASSERT(*prev_sel != nullptr && "shared indexer layer must follow a full indexer layer");
         sel = *prev_sel;
     }
+
+    // exact-lifetime pin (the sched's NONE-dep idiom): a no-op node whose src is the
+    // selection, placed after this layer's last tile. Without it the allocator drains
+    // the selection's refcount before the later CPU/GPU splits copy from its per-tile
+    // views, and same-graph MoE outputs recycle the block under the live readers (the
+    // deterministic garbage at 3+ big ubatches; repro: dev/demos kpool_chain_demo
+    // SEQ_SHARED)
+    // Dataflow liveness pin: chain each selection-lineage tensor's first element (scaled
+    // to an exact 0.0f) into a single scalar zero and add it to this layer's output.
+    // f32 x + 0.0f is bit-exact, but the views make every lineage tensor a real in-graph
+    // consumer at the layer tail -- past all the per-tile mask readers in later splits --
+    // so the allocator cannot free and recycle them under those readers. (NONE-op dep
+    // nodes appended directly to gf were not reliably reaching the final graph.)
+    auto pin_sel = [&](ggml_tensor * out) {
+        if (!sel_pin_outputs || out == nullptr) {
+            return out;
+        }
+        std::vector<ggml_tensor *> lineage = sel_liveness;
+        lineage.push_back(sel);
+        ggml_tensor * z = nullptr;
+        for (ggml_tensor * t : lineage) {
+            // non-view consumer: cont of the view is a NEW tensor whose src chain hits
+            // the parent without view aliasing -- a view consumer crossing a split gets
+            // an input COPY counted instead of the parent, leaving the parent free
+            ggml_tensor * zi = ggml_cont(ctx0, ggml_view_1d(ctx0, t, 1, 0));
+            zi = ggml_cast(ctx0, zi, GGML_TYPE_F32);
+            zi = ggml_scale(ctx0, zi, 0.0f);
+            z = z == nullptr ? zi : ggml_add(ctx0, z, zi);
+        }
+        return ggml_add(ctx0, out, z);
+    };
 
     if (q_absorbed) {
         // scatter path only; the gather path builds q_absorbed per tile inside the tile loop
@@ -1423,6 +1482,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             // pass the nvis INPUT BASE (views of inputs ride a fragile copy path); the tile
             // offset travels in op params
             ggml_tensor * mask_t = ggml_dsa_mask_block(ctx0, idx_t, nvis, tb, n_kv_attn, kq_mask->type);
+            if (auto * g = dynamic_cast<graph *>(this); g && g->sel_dbg_f32 != nullptr) {
+                mask_t->src[2] = g->sel_dbg_f32; // debug: pre-cast F32 ids (GGML_DSA_SEL_DUMP)
+            }
             cb(mask_t, "kq_mask_dsa_tile", il);
 
             ggml_tensor * out_t = build_attn_mha(q_t, k, v, nullptr, mask_t, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
@@ -1437,6 +1499,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             out = ggml_concat(ctx0, out, out_tiles[i], 1);
         }
         // wo applied per tile above
+        out = pin_sel(out);
         cb(out, "kqv_out", il);
         cb(out, "attn_out", il);
         return out;
@@ -1568,6 +1631,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     if (!inp_kpool->gather) {
         out = ggml_mul_mat(ctx0, layer.wo, out);
     }
+    out = pin_sel(out);
     cb(out, "attn_out", il);
 
     return out;
