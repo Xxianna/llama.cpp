@@ -1550,6 +1550,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             const char * e = getenv("GGML_DSA_GATHER_CHUNK");
             return e ? atoll(e) : 256;
         }();
+        // Chunking is a prefill-memory device: at decode sizes the whole gather is a few
+        // MB and splitting it just multiplies nodes (two passes x n_sel/chunk gathers and
+        // small GEMMs per DSA layer) with nothing for gallocr to rotate. Decode-sized
+        // batches take the single-chunk monolithic shape instead (the fork's original
+        // decode form); 16 matches the decode gate in build_inp_kpool.
+        const int64_t eff_chunk = n_tokens <= 16 ? n_sel : sel_chunk;
 
         std::vector<ggml_tensor *> out_tiles;
         for (int64_t tb = 0; tb < n_tokens; tb += gather_tile) {
@@ -1575,8 +1581,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             ggml_tensor * kq;
             {
                 std::vector<ggml_tensor *> kq_parts;
-                for (int64_t sc = 0; sc < n_sel; sc += sel_chunk) {
-                    const int64_t sn = std::min(sel_chunk, n_sel - sc);
+                for (int64_t sc = 0; sc < n_sel; sc += eff_chunk) {
+                    const int64_t sn = std::min(eff_chunk, n_sel - sc);
                     auto sel_c = ggml_cont(ctx0, ggml_view_2d(ctx0, sel_t, sn, tn, sel_t->nb[1], sc * sel_t->nb[0]));
                     auto k_g_c = mctx_hyb->gather_mla_rows(ctx0, sel_c, sn*tn, kv_lora_rank, il);
                     k_g_c = ggml_reshape_4d(ctx0, k_g_c, kv_lora_rank, sn, 1, tn);
@@ -1596,8 +1602,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             ggml_tensor * kqv;
             {
                 std::vector<ggml_tensor *> parts;
-                for (int64_t sc = 0; sc < n_sel; sc += sel_chunk) {
-                    const int64_t sn = std::min(sel_chunk, n_sel - sc);
+                for (int64_t sc = 0; sc < n_sel; sc += eff_chunk) {
+                    const int64_t sn = std::min(eff_chunk, n_sel - sc);
                     auto sel_c = ggml_cont(ctx0, ggml_view_2d(ctx0, sel_t, sn, tn, sel_t->nb[1], sc * sel_t->nb[0]));
                     auto k_g_c = mctx_hyb->gather_mla_rows(ctx0, sel_c, sn*tn, kv_lora_rank, il);
                     k_g_c = ggml_reshape_4d(ctx0, k_g_c, kv_lora_rank, sn, 1, tn);

@@ -102,6 +102,17 @@ static bool can_reuse_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
+    // The DSA gather / tiled-scatter paths replace the causal mask with a 1-element
+    // dummy (set_input writes one element harmlessly). With n_kv > 1 a real mask
+    // here would have ne[0] == n_kv, so a 1x1x1 mask can only be that dummy -- and
+    // failing this check on it disabled graph reuse for every token of long-context
+    // decode (full rebuild + re-capture per token, a fixed ~1.4x slowdown). Shape
+    // drift is still caught by the other inputs: the n_tokens checks here and the
+    // kpool input's own n_kv comparison.
+    if (kq_mask->ne[0] == 1 && kq_mask->ne[1] == 1 && kq_mask->ne[3] == 1 && n_kv > 1) {
+        return true;
+    }
+
     bool res = true;
 
     res &= (kq_mask->ne[0] == n_kv);
