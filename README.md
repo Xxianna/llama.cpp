@@ -159,6 +159,55 @@ env CUDA_VISIBLE_DEVICES=<GPU UUID> \
 
 </details>
 
+<details>
+<summary><b>RTX 4090D 48 GB（PCIe 3.0）· EPYC 7642 · GLM-5.3-Flash GSQ-RCO Q4（3.5bit）· 1M 上下文 · 权重预取</b></summary>
+
+### 测试环境
+
+| 项目 | 配置 |
+| --- | --- |
+| GPU | RTX 4090D 48 GB，PCIe 3.0 |
+| CPU / 内存 | EPYC 7642（48 核），8 通道 DDR4-2133，实测约 100 GB/s |
+| 模型 | [GLM-5.3-Flash Uncensored GSQ-RCO-Q4](https://huggingface.co/GCSA-AiLab/GLM-5.3-Flash-Uncensored-RCO-GSQ-GGUF/blob/main/Q4/GLM-5.3-Flash-Uncensored-GSQ-RCO-Q4.gguf)（GCSA-AiLab，137.1 GB，K 系混合 3.5bit） |
+| 推理形态 | 非专家权重与 KV（q8_0）驻 GPU；路由专家驻 CPU 内存；16 专家缓存槽/层 + 2 权重预取槽 |
+| 服务参数 | 上下文 1,048,576；batch 32,768；并发 1 |
+
+### 性能
+
+完整阶梯测量，同一会话，每点输入后生成 128 token：
+
+| 输入长度 (token) | Prefill (token/s) | Decode (token/s) |
+| ---: | ---: | ---: |
+| 64 | 60.24 | 19.18 |
+| 256 | 60.58 | 20.27 |
+| 1,024 | 122.61 | 19.65 |
+| 4,096 | 383.76 | 18.68 |
+| 16,384 | 714.84 | 19.99 |
+| 65,536 | 857.88 | 17.69 |
+| 262,144 | 652.17 | 16.54 |
+
+显存：1M 上下文全额预留（q8_0 KV）+ 16 槽专家缓存 + 2 预取槽 + 视觉适配器，空闲 40.8 GB（预取槽懒分配），实测峰值 45.3 / 48 GB。
+
+### 启动命令
+
+```bash
+env CUDA_VISIBLE_DEVICES=<GPU UUID> \
+    GGML_SCHED_H2D_ASYNC=1 \
+    LLAMA_MOE_CACHE_MAX_BATCH=512 \
+    GGML_DSA_SCATTER_TILE=512 \
+    ./build-release/bin/llama-server \
+    -m <模型路径>/GLM-5.3-Flash-Uncensored-GSQ-RCO-Q4.gguf \
+    --mmproj <模型路径>/mmproj-GLM-5.3-Flash-Uncensored-F16.gguf \
+    -ngl 99 --cpu-moe --moe cache=16,prefetch-slots=2 -fa on -np 1 \
+    -c 1048576 -ctk q8_0 -ctv q8_0 -t 48 -b 32768 -ub 32768 \
+    --load-mode none \
+    --host 0.0.0.0 --port 8302 --alias glm53f-gsq-4090 --jinja
+```
+
+环境变量同 4090D 组。`cache=16,prefetch-slots=2`：batch 32,768 下显存预算内的槽位组合；预取对 ≥ batch/2（16,384 token）的批生效。
+
+</details>
+
 ## 2. 显存占用估算
 
 显存 ≈ GPU 驻留权重 + KV 缓存 + KDA 循环状态 + 视觉适配器 + k16 转换缓存 + 专家缓存 + 权重预取 + 计算池：
