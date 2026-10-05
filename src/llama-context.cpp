@@ -1737,6 +1737,12 @@ static bool dsa_stage_dump_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
                        strstr(n, "indexer_sel_cat-3") != nullptr ||
                        strstr(n, "indexer_sel_idx-3") != nullptr ||
                        strstr(n, "indexer_sel_idx_mapped-3") != nullptr ||
+                       strstr(n, "indexer_map_live-3") != nullptr ||
+                       strstr(n, "indexer_map_dump-3") != nullptr ||
+                       strstr(n, "indexer_map_cast-3") != nullptr ||
+                       strstr(n, "indexer_map_sub-3") != nullptr ||
+                       strstr(n, "indexer_map_mul-3") != nullptr ||
+                       strstr(n, "indexer_map_add-3") != nullptr ||
                        strstr(n, "kpool_gather_mask") != nullptr;
     (void) per_tile;
     if (!stage) {
@@ -1745,7 +1751,6 @@ static bool dsa_stage_dump_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
     int64_t ncols = t->ne[1] > 0 ? t->ne[1] : 1;
     if (t->ne[3] > 1 && ncols == 1) {
         ncols = t->ne[3]; // 4d [n_sel, 1, 1, n_tokens] inputs: columns live in ne[3]
-        t = t; // strides: nb[3] is the column stride (handled below via nb[1]? no)
     }
     const int64_t row   = t->ne[0];
     auto col_head = [&](int64_t col) -> std::string {
@@ -1782,9 +1787,12 @@ static bool dsa_stage_dump_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
                 n, (long long) row, (long long) ncols, (int) t->type,
                 col_head(0).c_str(), col_head(ncols > 1024 ? 1024 : ncols - 1).c_str());
     } else if (stage) {
-        LLAMA_LOG_ERROR("STAGE %-32s [%lld x %lld] t=%d col512:%s | col49152:%s\n",
+        // clamp for 1d tensors (e.g. the dump arange): probe col0/last instead of oob
+        const int64_t c0 = ncols > 512   ? 512   : 0;
+        const int64_t c1 = ncols > 49152 ? 49152 : ncols - 1;
+        LLAMA_LOG_ERROR("STAGE %-32s [%lld x %lld] t=%d col%lld:%s | col%lld:%s\n",
                 n, (long long) row, (long long) ncols, (int) t->type,
-                col_head(512).c_str(), col_head(49152).c_str());
+                (long long) c0, col_head(c0).c_str(), (long long) c1, col_head(c1).c_str());
     }
     return true;
 }

@@ -1259,9 +1259,17 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     if (scatter_tiled) {
         ggml_tensor * seed_r = ggml_cast(ctx0, ggml_view_1d(ctx0, sel_idx, 1, 0), GGML_TYPE_F32);
         ggml_tensor * live_r  = ggml_exp(ctx0, ggml_reshape_2d(ctx0, inp_kpool->gather_mask, n_sel, n_tokens));
+        cb(live_r, "indexer_map_live", il);
         ggml_tensor * dump_r  = ggml_arange(ctx0, (float) n_kv, (float) (n_kv + n_sel), 1.0f);
-        ggml_tensor * idx_r   = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
-        idx_r = ggml_add(ctx0, ggml_mul(ctx0, ggml_sub(ctx0, idx_r, dump_r), live_r), dump_r);
+        cb(dump_r, "indexer_map_dump", il);
+        ggml_tensor * cast_r  = ggml_cast(ctx0, sel_idx, GGML_TYPE_F32);
+        cb(cast_r, "indexer_map_cast", il);
+        ggml_tensor * sub_r   = ggml_sub(ctx0, cast_r, dump_r);
+        cb(sub_r, "indexer_map_sub", il);
+        ggml_tensor * mul_r   = ggml_mul(ctx0, sub_r, live_r);
+        cb(mul_r, "indexer_map_mul", il);
+        ggml_tensor * idx_r   = ggml_add(ctx0, mul_r, dump_r);
+        cb(idx_r, "indexer_map_add", il);
 
         // Liveness pins for the selection tail. The pre-mapping sel_idx's last in-graph
         // consumer is the mapping's final cast; after that node the allocator frees its

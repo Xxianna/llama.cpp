@@ -1262,73 +1262,64 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         }
     }
 
-    // a pool is visible when it belongs to the token's sequence and ends at or before it
-    auto fill_mask = [&](auto * data) {
-        using T = std::remove_pointer_t<decltype(data)>;
-        const T keep = llama_cast<T>(0.0f);
-        const T drop = llama_cast<T>(-INFINITY);
+    // A pool is visible when it belongs to the token's sequence and ends at or before it.
+    // All three fills below must run on EVERY path: the split-score path swaps the dense
+    // [n_pool x n_tokens] mask for the 1x1 dummy, but it still consumes pool_nvis (chunk
+    // causal masks) AND gather_mask (scatter dump-mapping live factors / gather padding).
+    // The historic dummy branch filled only pool_nvis, so every split-path ubatch uploaded
+    // gather_mask straight from stale host bytes: exp() of recycled float data produced
+    // live factors ~0.98/1.005 instead of exactly 0/1, corrupting the dump-mapped indices
+    // (first big ubatch immune = fresh zero pages; rebuilds land on recycled activations).
+    const bool mask_f16 = pool_mask->type == GGML_TYPE_F16;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id s = ubatch->seq_id[i][0];
+        const llama_pos    p = ubatch->pos[i];
 
-        for (uint32_t i = 0; i < n_tokens; ++i) {
-            const llama_seq_id s = ubatch->seq_id[i][0];
-            const llama_pos    p = ubatch->pos[i];
+        const uint32_t p0 = seq_pool_start[s];
+        const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
+        const uint32_t nv = (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
 
-            const uint32_t p0 = seq_pool_start[s];
-            const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
-            const uint32_t nv = (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
-
-            // dense mask (only when pool_mask is full-size, not the split-score dummy)
-            if ((size_t) pool_mask->ne[0] * pool_mask->ne[1] > 1) {
-                T * row = data + (size_t) i*n_pool;
-                std::fill(row, row + n_pool, drop);
-                std::fill(row + p0, row + p0 + nv, keep);
-            }
-
-            // per-token visible count (used by the split-score path's GPU-computed masks)
-            if (pool_nvis != nullptr && pool_nvis->buffer) {
-                ((float *) pool_nvis->data)[i] = (float) (p0 + nv);
-            }
-
-            // Finite visible pools occupy the first min(nv, n_top) ranked slots.
-            if (gm != nullptr) {
-                const uint32_t nvc = std::min(nv, n_top);
-                float * grow = gm + (size_t) i*n_sel;
-                std::fill(grow,                        grow + (size_t) nvc*kpool,  0.0f);
-                std::fill(grow + (size_t) nvc*kpool,   grow + (size_t) n_top*kpool, -INFINITY);
+        // dense mask (only when pool_mask is full-size, not the split-score dummy)
+        if (!pool_mask_dummy) {
+            if (mask_f16) {
+                ggml_fp16_t * row = (ggml_fp16_t *) pool_mask->data + (size_t) i*n_pool;
+                std::fill(row, row + n_pool, llama_cast<ggml_fp16_t>(-INFINITY));
+                std::fill(row + p0, row + p0 + nv, llama_cast<ggml_fp16_t>(0.0f));
+            } else {
+                float * row = (float *) pool_mask->data + (size_t) i*n_pool;
+                std::fill(row, row + n_pool, -INFINITY);
+                std::fill(row + p0, row + p0 + nv, 0.0f);
             }
         }
-    };
-    if (pool_mask_dummy) {
-        // the split-score path reads pool_nvis as its only causal-mask source: fill it
-        // (this used to live inside fill_mask, which the dummy branch never called --
-        // every split-path selection since the nvis rework ran with all-zero nvis)
+
+        // per-token visible count (the split-score path's causal-mask source)
         if (pool_nvis != nullptr && pool_nvis->buffer) {
-            float * nv_data = (float *) pool_nvis->data;
-            for (uint32_t i = 0; i < n_tokens; ++i) {
-                const llama_seq_id s = ubatch->seq_id[i][0];
-                const llama_pos    p = ubatch->pos[i];
-                const uint32_t p0 = seq_pool_start[s];
-                const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
-                const uint32_t nv = (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
-                nv_data[i] = (float) (p0 + nv);
-            }
+            ((float *) pool_nvis->data)[i] = (float) (p0 + nv);
         }
-    } else if (pool_mask->type == GGML_TYPE_F16) {
-        fill_mask((ggml_fp16_t *) pool_mask->data);
-    } else {
-        fill_mask((float *) pool_mask->data);
+
+        // Finite visible pools occupy the first min(nv, n_top) ranked slots.
+        if (gm != nullptr) {
+            const uint32_t nvc = std::min(nv, n_top);
+            float * grow = gm + (size_t) i*n_sel;
+            std::fill(grow,                        grow + (size_t) nvc*kpool,  0.0f);
+            std::fill(grow + (size_t) nvc*kpool,   grow + (size_t) n_top*kpool, -INFINITY);
+        }
     }
 
     if (getenv("GGML_DSA_SEL_DUMP") && gm != nullptr) {
-        const int64_t ntok = (int64_t) gather_mask->ne[3];
-        auto gmv = [&](int64_t tok) {
-            return ((const float *) gm)[(size_t) tok * n_sel];
+        // layout is [n_sel, 1, 1, n_tokens]: token i's row starts at i*n_sel floats.
+        // ne[3] is n_tokens too, but the ubatch count is the authoritative source here.
+        const int64_t ntok = (int64_t) n_tokens;
+        auto gm_at = [&](int64_t tok, int64_t slot) -> float {
+            return (tok >= 0 && tok < ntok && slot >= 0 && slot < (int64_t) n_sel)
+                ? gm[(size_t) tok * n_sel + slot] : 0.0f;
         };
-        char b1[128] = {0}, b2[128] = {0}, b3[128] = {0};
-        snprintf(b1, sizeof(b1), "%.3g,%.3g,%.3g,%.3g", gmv(512), gmv(512)+1, gmv(49152), ((const float *) gm)[(size_t) 49152 * n_sel + 1]);
-        snprintf(b2, sizeof(b2), "%.3g", ((const float *) gm)[(size_t) 49152 * n_sel + 2047]);
-        snprintf(b3, sizeof(b3), "%.3g", ((const float *) gm)[(size_t) (ntok - 1) * n_sel]);
-        fprintf(stderr, "gm-host ntok=%lld gm[512]=%s gm[49152s2050]=%s gm[last]=%s\n",
-                (long long) ntok, b1, b2, b3);
+        const int64_t probe = ntok > 49152 ? 49152 : ntok - 1;
+        fprintf(stderr,
+                "gm-host ntok=%lld nsel=%u t512[0..3]=%.3g,%.3g,%.3g,%.3g t%lld[2047]=%.3g tlast[0]=%.3g\n",
+                (long long) ntok, n_sel,
+                gm_at(512, 0), gm_at(512, 1), gm_at(512, 2), gm_at(512, 3),
+                (long long) probe, gm_at(probe, 2047), gm_at(ntok - 1, 0));
     }
 
     if (getenv("GGML_DSA_SEL_DUMP") && pool_nvis != nullptr && pool_nvis->buffer) {
