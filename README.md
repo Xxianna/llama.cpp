@@ -1,3 +1,179 @@
+<!-- dev-glm53f report (2026-10-05). English by default — switch to Chinese at the prominent link below. -->
+
+<a id="dev-glm53f"></a>
+
+# GLM-5.3-Flash at 1M context on one 48 GB card — the dev-glm53f line
+
+**English (default)** · **[切换到中文版 →](#cn)**
+
+This branch of the fork runs **GLM-5.3-Flash** — a 180 GB Q4_K_M mixture-of-experts model with 288 experts per layer and
+hybrid linear (KDA) + sparse-indexed (DSA) attention — with a **1,048,576-token context**, **full 65,536-token
+micro-batches**, the **live expert cache** and the **vision adapter**, on a **single 48 GB GPU** backed by CPU RAM,
+with output correctness verified up to 250k-token prompts. At the fork point this configuration did not fit at any
+context: selection-scoring memory grew with context x batch (extrapolated ~93 GB at 1M), and 53k+ token batches hit
+launch-limit crashes.
+
+## How fast
+
+Machine E: RTX 4090D 48 GB · EPYC 7642 (48 cores, ~100 GB/s RAM, ~6 GB/s PCIe) · GLM-5.3-Flash Q4_K_M (179.7 GB,
+experts in system RAM) · 1M context reserved with q8_0 KV. Rows marked ◆ were measured on the companion 64 GB
+(CMP 170HX) card with 29 cache slots; all other rows are machine E with 6 slots.
+
+| test | fork base at this scale | this branch |
+|---|---|---|
+| 1M context + 65,536-token batches + cache + vision | does not fit (selection memory ~93 GB extrapolated) | **runs; peak 46.8 / 48 GB** |
+| prompt processing, full 65k batch, no expert cache | crashes at ≥53k batches | **643 t/s** |
+| prompt processing, full 65k batch ◆ | — | **468 t/s (53k chunk)** |
+| prompt processing, 69k–250k-token prompts, 6 cache slots | — | **358–433 t/s, output correct** (diagnostics on) |
+| decode, short chat (6 cache slots) | 14.9 t/s (same protocol) | **15.5 t/s (+3.8%)** |
+| decode, short chat ◆ (29 cache slots) | — | **17.6 t/s** |
+| correctness | — | sanity arithmetic + verifiable recall at 69k / 125k / 138k / 179k / 250k, all coherent |
+
+The decode row is a measured A/B (same protocol, temperature 0, 3–4 runs); the base column otherwise describes what the
+fork base does at these scales — it cannot complete these runs, so those cells are states, not benchmarks.
+
+## The optimizations
+
+**A. Selection memory made context-bounded (this is what fits 1M).**
+- *Chunked indexer scoring.* The sparse-indexer score is computed in (context-chunk x token-tile) blocks with a running
+  top-k merge; a product gate keeps small batches on the monolithic path. Selection peak stops growing with
+  context x batch: measured **flat 46.8 GB peak from 69k to 250k tokens** at full 1M reservation.
+- *Per-token visibility instead of dense masks.* The [pools x tokens] causal-mask input (hundreds of GB of host data at
+  1M) becomes a per-token visible-count vector; chunk masks are computed on the GPU when needed.
+- *Fused causal mask blocks.* Each tile's mask block is written by a single GPU pass straight into the attention layout,
+  replacing a ~10-op tensor chain (~6 KB → ~1 KB per token of mask traffic).
+
+**B. Prefill throughput: token-tiled sparse scatter.**
+- *Tiled scatter attention.* Large single-sequence batches run the DSA attention in token tiles — dump-mapped indices,
+  per-tile sparse flash attention, per-tile output projection. This escapes the gather path's latent-copy bandwidth
+  wall: **468 t/s vs 158 t/s (2.9x)** on the same 53k chunk, and full 65k batches at **643 t/s** with the conversion
+  cache below.
+- *Whole-KV f16 conversion cache.* The quantized-KV → f16 conversion for flash attention is cached for the whole KV
+  store instead of redone per batch, removing ~90 GiB of redundant conversion traffic per batch: **468 → 643 t/s (+37%)**.
+
+**C. Scale stability and determinism (64k → 262k+).**
+- *Batched kernel launches* wherever a token or KV dimension rides a CUDA grid axis that caps at 65,535 — 262k-token
+  full-context batches run stable.
+- *Tiled, two-pass batched expert GEMM* keeps per-call shared memory bounded — 53k+ token batches no longer trip
+  shared-memory assertions or progressive flush misalignment.
+- *Grid-overflow guard for batched MMVQ/MMQ* — an upstream-level bug any model hits on batched quantized paths at these sizes.
+- *Deterministic top-k by default* (segmented argsort): the CCCL DeviceTopK fast path races on CCCL < 3.4.3
+  (acknowledged upstream). Selection is now reproducible run-to-run.
+- *Cross-backend selection parity.* CPU and GPU top-k/argsort orderings are made identical, every selection input is
+  filled on every path, and scheduler rebinding is restored when a graph re-splits — the chunked and monolithic
+  selection paths are value-equivalent at any scale (verified at the token level at 250k).
+
+**D. The MoE pipeline on one card.**
+- *Expert-chain tiling by tokens* keeps decode-scale activations from blowing the compute buffer, so the expert cache
+  coexists with full 65k batches inside 48 GB.
+- *One full copy per graph for host-resident expert weights shared by several consumers* in tiled graphs — tiled
+  execution always reads complete weights, with no bandwidth cost at these sizes.
+- *Admission control + dynamic upload lookahead for the expert cache* (adopted from the fork's newer line): a missed
+  expert must recur within a 64-token window before taking a slot, and predicted uploads are timed by measured link
+  bandwidth vs layer time. Decode here: **14.9 → 15.5 t/s (+3.8%)**, cache hit 12% → 14% on the short-chat workload.
+- *Short-prompt cliff removed:* batches up to 512 tokens now use the cached-expert path in place (previously only
+  ≤31-token batches did — short prompts lost ~9 t/s above that line).
+
+**E. Enablement and instrumentation.**
+- *GLM-5.3-Flash GGUF compatibility* for the unsloth-family quantized releases (architecture naming, KV prefixes,
+  vision adapter): the five-shard Q4_K_M + mmproj load and serve.
+- *Opt-in diagnostics* (~1.5x slower only when enabled): per-node post-eval dumps with backend-safe reads,
+  allocation-plan liveness dumps, per-request cache churn logging — what made scale issues bisectable in single runs.
+
+## vs stock llama.cpp
+
+glm5-next / GLM-5.3-Flash is not supported upstream at the fork point. Mixed CPU/GPU MoE serving with the live expert
+cache, placement and self-tuning come from the neurall fork. Everything in sections A–E above is this line.
+
+## vs the neurall fork (base)
+
+The base targets multi-GPU 24 GB-class rigs at ≤64k contexts (its own headline: 1.7–2.4x decode vs upstream). This
+line targets **one 48 GB card at 1M context with full 65,536-token batches and vision**, adding the tiled-scatter
+prefill path, context-bounded selection memory, 262k-scale launch fixes, deterministic top-k and cross-backend
+selection parity, GLM-5.3-Flash GGUF compatibility — and it adopts the base's newer cache scheduling
+(admission/lookahead) while keeping the older knob names.
+
+---
+
+<a id="cn"></a>
+
+# 中文：GLM-5.3-Flash 单张 48 GB 卡跑满 1M 上下文（dev-glm53f 分支）
+
+**[→ English version](#dev-glm53f)** · **中文**
+
+本分支在**单张 48 GB GPU + 内存后备**上运行 **GLM-5.3-Flash**（180 GB Q4_K_M 混合专家模型，每层 288 专家，
+KDA 线性注意力 + DSA 稀疏索引注意力混合）：**1,048,576 上下文**、**满 65,536 微批**、**专家缓存**与**视觉适配器**
+同时开启，输出正确性已验证到 250k token。切出基线 fork 时该配置任何上下文都装不下：选择/打分内存随
+上下文×批增长（1M 外推约 93 GB），53k+ 批触发启动上限崩溃。
+
+## 实测速度
+
+机器 E：RTX 4090D 48 GB · EPYC 7642（48 核，内存 ~100 GB/s，PCIe ~6 GB/s）· GLM-5.3-Flash Q4_K_M（179.7 GB，
+专家驻内存）· 1M 上下文全额预留 + q8_0 KV。带 ◆ 的行在配套 64 GB 卡（CMP 170HX、29 缓存槽）上测得；
+其余为机器 E、6 缓存槽。
+
+| 测试 | 基线 fork 在此规模 | 本分支 |
+|---|---|---|
+| 1M 上下文 + 65,536 微批 + 缓存 + 视觉 | 装不下（选择内存外推 ~93 GB） | **可跑；峰值 46.8 / 48 GB** |
+| 长文处理，65k 满批，无专家缓存 | ≥53k 批崩溃 | **643 t/s** |
+| 长文处理，65k 满批 ◆ | — | **468 t/s（53k 分块）** |
+| 长文处理，69k–250k 长文，6 缓存槽 | — | **358–433 t/s，输出正确**（诊断开启） |
+| 解码，短对话（6 缓存槽） | 14.9 t/s（同协议） | **15.5 t/s（+3.8%）** |
+| 解码，短对话 ◆（29 缓存槽） | — | **17.6 t/s** |
+| 正确性 | — | 算术 sanity + 69k/125k/138k/179k/250k 长文可核验复述，全部连贯 |
+
+解码行为实测 A/B（同协议、temperature 0、各 3–4 轮）；"基线"列其余格描述的是基线在此规模下的状态——
+它无法完成这些运行，故不是同表基准。
+
+## 优化内容
+
+**A. 选择内存与上下文解耦（1M 装得下的根本）。**
+- *索引打分分块*：稀疏索引打分按（上下文块 × token 片）分块计算 + 滚动 top-k 归并；乘积门控让小批留在单块路径。
+  选择峰值不再随上下文×批增长：1M 全额预留下 69k→250k token 实测峰值**恒定 46.8 GB**。
+- *逐 token 可见计数替代稠密掩码*：[池数×token数] 因果掩码输入（1M 时数百 GB 宿主数据）换成逐 token 可见计数向量，
+  块掩码在 GPU 上按需现算。
+- *融合因果掩码块*：每个分块的掩码由单趟 GPU 核直接按注意力布局写出，取代 ~10 算子张量链
+  （掩码流量 ~6 KB → ~1 KB/token）。
+
+**B. 长文吞吐：token 分块稀疏 scatter。**
+- *分块 scatter 注意力*：大单序列批按 token 片执行 DSA 注意力——转储行映射索引、逐片稀疏 flash attention、
+  逐片输出投影。绕开 gather 路的 latent 拷贝带宽墙：同一 53k 分块 **468 t/s 对 158 t/s（2.9×）**。
+- *全 KV 库 f16 转换缓存*：量化 KV→f16 转换按整个 KV 库缓存而非逐批重转，每批省 ~90 GiB 冗余转换流量：
+  **468 → 643 t/s（+37%）**。
+
+**C. 规模稳定性与确定性（64k → 262k+）。**
+- *核分批发射*：凡 token/KV 维度挂在 CUDA 网格轴（上限 65,535）的核一律分批——262k 全上下文批稳定运行。
+- *分块两遍式批量专家 GEMM*：每次调用的共享内存有界——53k+ 批不再触发共享内存断言/渐进错位。
+- *批量 MMVQ/MMQ 网格溢出防护*：上游级 bug，任何模型在批量量化路径达此规模都会踩。
+- *默认确定性 top-k*（分段 argsort）：CCCL<3.4.3 的 DeviceTopK 快速路存在竞态（上游已确认）。选择逐次可复现。
+- *跨后端选择一致性*：CPU/GPU top-k/argsort 排序对齐、所有路径都填充选择输入、图重分裂时调度器绑定还原——
+  分块路与单块路在任何规模下取值等价（250k 处逐 token 验证）。
+
+**D. 单卡 MoE 流水线。**
+- *专家链按 token 分块*：解码规模激活不再撑爆计算缓冲，专家缓存与满 65k 批在 48 GB 内共存。
+- *宿主驻留专家权重每图一次全量拷贝*（多消费者共享时）：分块执行总是读到完整权重，此规模下无带宽代价。
+- *专家缓存准入控制 + 动态上传前瞻*（采纳基线新线）：miss 专家须在 64 token 窗口内复现才占槽，预测上传按实测
+  链路带宽/层耗时定时机。本机解码 **14.9 → 15.5 t/s（+3.8%）**，短对话命中率 12% → 14%。
+- *短 prompt 断崖消除*：≤512 token 批即走缓存专家就地路径（此前仅 ≤31 批——越过该线短 prompt 损失 ~9 t/s）。
+
+**E. 使能与插桩。**
+- *GLM-5.3-Flash GGUF 兼容*（unsloth 系量化发布：架构命名、KV 前缀、视觉适配器）：五分片 Q4_K_M + mmproj 加载即用。
+- *可选诊断*（仅开启时 ~1.5× 减速）：逐节点产后读回转储、分配规划活性转储、逐请求缓存 churn 日志——
+  规模问题单轮可二分的工具基础。
+
+## 与 llama.cpp 原版的区别
+
+glm5-next / GLM-5.3-Flash 在切点时上游不支持。CPU/GPU 混合 MoE 服务、专家缓存、放置与自调优来自 neurall fork。
+上文 A–E 全部为本分支工作。
+
+## 与 neurall fork（基线）的区别
+
+基线面向多卡 24 GB 级机器、≤64k 上下文（其自述：解码较上游 1.7–2.4×）。本分支面向**单张 48 GB 卡、1M 上下文、
+满 65,536 微批 + 视觉**，新增分块 scatter 长文路径、上下文有界的选择内存、262k 级发射修复、确定性 top-k 与
+跨后端选择一致性、GLM-5.3-Flash GGUF 兼容；同时采纳基线新线的缓存调度（准入/前瞻），保留旧旋钮命名。
+
+---
+
 # llama.cpp fork: 1.7x to 2.4x faster decode on MoE models bigger than your VRAM
 
 The newest mixture-of-experts models (GLM-5.3-Flash, MiMo-V2.6-Flash, Qwen3.8-Flash-Next, Qwen3.6) are far bigger than a gaming GPU.
