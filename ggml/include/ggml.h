@@ -2701,7 +2701,9 @@ extern "C" {
     //        to the clamp/cast/set_rows chain it replaces)
     GGML_API struct ggml_tensor * ggml_dsa_mask_block(
             struct ggml_context * ctx,
-            struct ggml_tensor  * sel,
+            struct ggml_tensor  * sel,       // I32 [n_sel, n_tokens] BASE tensor (not a per-tile view)
+            int64_t               sel_off,   // this tile's first token (op param, not a view)
+            int64_t               tn,        // this tile's token count
             struct ggml_tensor  * nvis,      // F32 [n_tokens] INPUT base (not a view); debug invariant only
             int64_t               nvis_off,  // this tile's first token
             int64_t               n_kv,

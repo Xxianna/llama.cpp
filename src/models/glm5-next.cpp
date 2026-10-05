@@ -1478,10 +1478,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             // replaces (single-sequence 1d: live selections are always within the causal
             // prefix, so the causal base is 0 exactly there); one [n_kv x tn] tensor
             // instead of ~6 F32/F16 intermediates of the same shape.
-            auto idx_t = ggml_view_2d(ctx0, sel, n_sel, tn, sel->nb[1], tb * sel->nb[1]);
-            // pass the nvis INPUT BASE (views of inputs ride a fragile copy path); the tile
-            // offset travels in op params
-            ggml_tensor * mask_t = ggml_dsa_mask_block(ctx0, idx_t, nvis, tb, n_kv_attn, kq_mask->type);
+            // The sel BASE is passed with the tile offset in op params: per-tile view
+            // tensors here had their consumption edges stripped by the sched's pass-5
+            // rebind machinery, ending the lineage's planned lifetime before all real
+            // readers (the >=131k corruption); a base + offset contract makes sel one
+            // ordinary input held to its last true consumer.
+            ggml_tensor * mask_t = ggml_dsa_mask_block(ctx0, sel, tb, tn, nvis, tb, n_kv_attn, kq_mask->type);
             if (auto * g = dynamic_cast<graph *>(this); g && g->sel_dbg_f32 != nullptr) {
                 mask_t->src[2] = g->sel_dbg_f32; // debug: pre-cast F32 ids (GGML_DSA_SEL_DUMP)
             }

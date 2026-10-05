@@ -8,12 +8,12 @@
 
 template <typename T>
 static __global__ void dsa_mask_block_kernel(
-        const int * __restrict__ sel, T * __restrict__ dst,
+        const int * __restrict__ sel, const int sel_off, T * __restrict__ dst,
         const int n_kv, const int n_sel, const size_t sel_nb1, const T drop, const T keep) {
     const int t = blockIdx.x;
 
     T * __restrict__ col = dst + (int64_t) t*n_kv; // dst is contiguous [n_kv, n]
-    const int * __restrict__ s = (const int *) ((const char *) sel + (size_t) t*sel_nb1);
+    const int * __restrict__ s = (const int *) ((const char *) sel + (size_t) (t + sel_off)*sel_nb1);
 
     for (int r = threadIdx.x; r < n_kv; r += blockDim.x) {
         col[r] = drop;
@@ -38,11 +38,11 @@ static __global__ void dsa_mask_block_kernel(
 // i.e. every non-dump row must be < nvis[t]. Prints one line per token column from
 // block 0 and a violation line from any block that sees a leak.
 static __global__ void dsa_mask_block_check_kernel(
-        const int * __restrict__ sel, const float * __restrict__ nvis, const int nvis_off,
+        const int * __restrict__ sel, const int sel_off, const float * __restrict__ nvis, const int nvis_off,
         const int n_kv, const int n_sel, const size_t sel_nb1,
         const float * __restrict__ f32dbg) {
     const int t = blockIdx.x;
-    const int * __restrict__ s = (const int *) ((const char *) sel + (size_t) t*sel_nb1);
+    const int * __restrict__ s = (const int *) ((const char *) sel + (size_t) (t + sel_off)*sel_nb1);
     const int nv = (int) nvis[t + nvis_off];
 
     int leak = 0, neg = 0, dump = 0, mn = 1 << 30, mx = -1;
@@ -71,6 +71,7 @@ static __global__ void dsa_mask_block_check_kernel(
                     nv, n_kv, n_sel, s_dump, s_mn, s_mx, s[0], s[1], s[2]);
         }
         if (f32dbg != nullptr && threadIdx.x == 0 && (s_leak > 0 || s_neg > 0 || blockIdx.x == 0)) {
+            // (f32dbg indexing follows the flat layout of the ORIGINAL [2051, n] tensor)
             // the pre-cast F32 ids for this column: NaN/huge => the ids were already
             // garbage floats before the I32 cast; finite == cast => cast-side issue
             printf("f32dbg t=%d f0=%g f1=%g f2=%g isnan=%d\n",
@@ -85,7 +86,7 @@ static void dsa_mask_block_f16(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const ggml_tensor * nvis = dst->src[1];
 
     const int n_kv  = (int) dst->ne[0];
-    const int n_tok = (int) dst->ne[1];
+    const int n_tok = (int) dst->ne[1]; // tile token count (dst is [n_kv, tile])
     const int n_sel = (int) sel->ne[0];
 
     const dim3 blocks_num(n_tok, 1, 1);
@@ -93,14 +94,16 @@ static void dsa_mask_block_f16(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     cudaStream_t stream = ctx.stream();
 
+    const int sel_off = ggml_get_op_params_i32(dst, 1);
+
     if (dst->type == GGML_TYPE_F16) {
         const half drop = __float2half(-1e9f); // saturates to -inf
         const half keep = __float2half(0.0f);
         dsa_mask_block_kernel<<<blocks_num, block_dim, 0, stream>>>(
-                (const int *) sel->data, (half *) dst->data, n_kv, n_sel, sel->nb[1], drop, keep);
+                (const int *) sel->data, sel_off, (half *) dst->data, n_kv, n_sel, sel->nb[1], drop, keep);
     } else {
         dsa_mask_block_kernel<<<blocks_num, block_dim, 0, stream>>>(
-                (const int *) sel->data, (float *) dst->data, n_kv, n_sel, sel->nb[1], -INFINITY, 0.0f);
+                (const int *) sel->data, sel_off, (float *) dst->data, n_kv, n_sel, sel->nb[1], -INFINITY, 0.0f);
     }
 
     const int nvis_off = nvis != nullptr ? ggml_get_op_params_i32(dst, 0) : 0;
@@ -131,7 +134,7 @@ static void dsa_mask_block_f16(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     if (sel_dump && nvis != nullptr && nvis->buffer != nullptr) {
         const ggml_tensor * f32dbg = dst->src[2];
         dsa_mask_block_check_kernel<<<blocks_num, block_dim, 0, stream>>>(
-                (const int *) sel->data, (const float *) nvis->data, nvis_off, n_kv, n_sel, sel->nb[1],
+                (const int *) sel->data, sel_off, (const float *) nvis->data, nvis_off, n_kv, n_sel, sel->nb[1],
                 (f32dbg != nullptr && f32dbg->buffer != nullptr) ? (const float *) f32dbg->data : nullptr);
     }
     CUDA_CHECK(cudaGetLastError());

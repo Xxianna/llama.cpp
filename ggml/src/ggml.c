@@ -6523,6 +6523,8 @@ struct ggml_tensor * ggml_lightning_indexer(
 struct ggml_tensor * ggml_dsa_mask_block(
         struct ggml_context * ctx,
         struct ggml_tensor  * sel,
+        int64_t               sel_off,
+        int64_t               tn,
         struct ggml_tensor  * nvis,
         int64_t               nvis_off,
         int64_t               n_kv,
@@ -6531,15 +6533,17 @@ struct ggml_tensor * ggml_dsa_mask_block(
     GGML_ASSERT(sel->type == GGML_TYPE_I32);
     GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
     GGML_ASSERT(sel->ne[2] == 1 && sel->ne[3] == 1);
-    GGML_ASSERT(nvis == NULL || (nvis->type == GGML_TYPE_F32 && nvis_off + sel->ne[1] <= nvis->ne[0]));
+    GGML_ASSERT(sel_off + tn <= sel->ne[1]);
+    GGML_ASSERT(nvis == NULL || (nvis->type == GGML_TYPE_F32 && nvis_off + tn <= nvis->ne[0]));
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, type, n_kv, sel->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, type, n_kv, tn);
 
     result->op     = GGML_OP_DSA_MASK_BLOCK;
     result->src[0] = sel;
     result->src[1] = nvis;
 
     ggml_set_op_params_i32(result, 0, (int32_t) nvis_off);
+    ggml_set_op_params_i32(result, 1, (int32_t) sel_off);
 
     return result;
 }
