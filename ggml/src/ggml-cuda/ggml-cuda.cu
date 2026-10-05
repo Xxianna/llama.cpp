@@ -1957,6 +1957,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
+    // debug probe: print the src0 data pointer the kernels will use (bisect only)
+    static int ptr_dbg_n = 0;
+    static const bool ptr_dbg = getenv("GGML_MMID_PTR_DEBUG") != nullptr;
+    if (ptr_dbg && ptr_dbg_n < 24 && ggml_nbytes(src0) > 1000*1000*1000) {
+        ptr_dbg_n++;
+        // also read back the first bytes the kernels are about to consume
+        uint8_t head[8] = {};
+        CUDA_CHECK(cudaMemcpy(head, src0->data, 8, cudaMemcpyDeviceToHost));
+        fprintf(stderr, "MMIDPTR '%s' src0=%p data=%p head=", src0->name, (const void *) src0, src0->data);
+        for (int b = 0; b < 8; b++) fprintf(stderr, "%02x", head[b]);
+        fprintf(stderr, " n=%zu ids=[%lld,%lld]\n", ggml_nbytes(src0), ids->ne[0], ids->ne[1]);
+    }
+
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -4781,7 +4794,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
 #ifdef USE_CUDA_GRAPH
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
-    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    // debug probe: GGML_CUDA_GRAPHS_OFF=1 disables capture/replay for this backend (bisect only)
+    static const bool graphs_off_dbg = getenv("GGML_CUDA_GRAPHS_OFF") != nullptr;
+    const bool use_cuda_graph = !graphs_off_dbg && ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
     GGML_UNUSED(cuda_ctx);

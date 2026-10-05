@@ -875,8 +875,18 @@ struct ggml_backend_sched {
     ggml_backend_event_t  prefetch_ready[GGML_SCHED_MAX_PREFETCH_SLOTS];
     ggml_backend_event_t  prefetch_free [GGML_SCHED_MAX_PREFETCH_SLOTS];
     bool prefetch_used[GGML_SCHED_MAX_PREFETCH_SLOTS];
+    int64_t prefetch_min_tokens;        // fire full-tensor prefetch only when the batch has at least this many
+                                        // tokens (0: always). Set to n_ubatch/2: below that the ids-driven
+                                        // used-experts copy moves fewer bytes than a full upload (skewed routing),
+                                        // and the boundary rides the batch size, which itself scales with the
+                                        // compute-to-PCIe-bandwidth ratio.
     std::vector<ggml_tensor *> weights_full_copied; // multi-consumer mm_id weights already fully copied this graph
-    std::vector<std::pair<ggml_tensor *, int>> mmid_n_consumers; // graph-wide MUL_MAT_ID consumers per weights copy
+    struct mmid_info {
+        ggml_tensor * w;                // the weights copy
+        int           consumers;        // graph-wide MUL_MAT_ID consumers of it
+        int64_t       tokens;           // sum of the consumers' ids widths = the batch's token count
+    };
+    std::vector<mmid_info> mmid_n_consumers;
     // pass-5 rebinds node->src[j] to the split's input copy IN PLACE. When the same
     // graph is split again (decode reuse, reserve re-plan) after sched_reset cleared
     // the copy registry, that stale copy hashes as an already-local tensor, is never
@@ -1957,16 +1967,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     // graph-wide MUL_MAT_ID consumer count per weights copy: token-tiled expert chains
     // share one input_cpy across several consumers (possibly across splits), and the
-    // used-experts copy below must not run per consumer on the shared buffer
+    // used-experts copy below must not run per consumer on the shared buffer. The ids
+    // widths sum to the batch's token count (per-tile views for tiled chains), which
+    // gates the full-tensor prefetch by batch size.
     for (int i = 0; i < sched->graph.n_nodes; ++i) {
         struct ggml_tensor * n = sched->graph.nodes[i];
         if (n->op == GGML_OP_MUL_MAT_ID && n->src[0]) {
+            const int64_t ids_tokens = n->src[2] ? n->src[2]->ne[1] : 0;
             bool found = false;
             for (auto & kv : sched->mmid_n_consumers) {
-                if (kv.first == n->src[0]) { kv.second++; found = true; break; }
+                if (kv.w == n->src[0]) { kv.consumers++; kv.tokens += ids_tokens; found = true; break; }
             }
             if (!found) {
-                sched->mmid_n_consumers.push_back({n->src[0], 1});
+                sched->mmid_n_consumers.push_back({n->src[0], 1, ids_tokens});
             }
         }
     }
@@ -2008,6 +2021,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
     std::vector<prefetch_pending> lookahead(sched->n_splits);
 
+    static const bool pf_dbg = getenv("GGML_PF_DEBUG") != NULL; // debug probe: fire/consume pointer chain
+    static const bool pf_dbg2 = pf_dbg && atoi(getenv("GGML_PF_DEBUG")) >= 2; // also verify slot content
+    int pf_dbg_n = 0; // debug probe: cap the prints
+    int pf_probe_n = 0; // content probes: first few tensors only
+    int pf_probe2_n = 0; // restore-time probes
+
     auto try_fire_prefetch = [&](int target_id) {
         if (target_id >= sched->n_splits) return;
         if (!sched->prefetch_experts || sched->callback_eval) return;
@@ -2030,6 +2049,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const ggml_tensor * ids = node->src[2];
         const int64_t n_expert = input->ne[2];
         if (ids->ne[0]*ids->ne[1] < 2*n_expert) return;
+        // Prefetch uploads the FULL tensor without waiting for the routing ids. Below
+        // prefetch_min_tokens (n_ubatch/2) the routing is skewed enough that the
+        // ids-driven used-experts copy moves fewer bytes over PCIe than a full upload
+        // (measured: 1k -31%, 4k -15% t/s when prefetching below the boundary on the
+        // 170HX); at large batches virtually every expert is used and the overlap wins.
+        if (sched->prefetch_min_tokens > 0) {
+            int64_t batch_tokens = 0;
+            for (auto & kv : sched->mmid_n_consumers) {
+                if (kv.w == input_cpy) { batch_tokens = kv.tokens; break; }
+            }
+            if (batch_tokens < sched->prefetch_min_tokens) return;
+        }
 
         ggml_backend_t s_backend = sched->backends[s->backend_id];
         if (!ggml_backend_sched_prefetch_init(sched, s_backend, ggml_nbytes(input))) return;
@@ -2047,6 +2078,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         input_cpy->data = ggml_backend_buffer_get_base(sched->prefetch_slots[slot]);
         ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
         ggml_backend_event_record(sched->prefetch_ready[slot], sched->prefetch_backend);
+        if (pf_dbg && pf_dbg_n < 200) {
+            pf_dbg_n++;
+            const uint8_t * hb = (const uint8_t *) input->data;
+            fprintf(stderr, "PFDBG fire tgt=%d %s slot=%d cpy=%p data=%p hosthead=%02x%02x%02x%02x%02x%02x%02x%02x n=%zu (saved=%p)\n",
+                target_id, input->name, slot, (void *) input_cpy, input_cpy->data,
+                hb[0],hb[1],hb[2],hb[3],hb[4],hb[5],hb[6],hb[7],
+                ggml_nbytes(input), lookahead[target_id].saved_data);
+        }
     };
 
     // Prime the pipeline: fire prefetch for splits [0, LOOKAHEAD]
@@ -2150,6 +2189,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             prefetch_input_cpy    = lookahead[split_id].input_cpy;
             prefetch_saved_buffer = lookahead[split_id].saved_buffer;
             prefetch_saved_data   = lookahead[split_id].saved_data;
+            if (pf_dbg && pf_dbg_n < 400) {
+                pf_dbg_n++;
+                fprintf(stderr, "PFDBG consume-enter split=%d slot=%d cpy=%p data-now=%p (fire-saved=%p)\n",
+                    split_id, split_prefetch_slot, (void *) prefetch_input_cpy, prefetch_input_cpy->data,
+                    prefetch_saved_data);
+                if (pf_dbg2 && pf_probe_n < 24 && (pf_probe_n % 4) == 0) { // GGML_PF_DEBUG=2: verify slot bytes vs host source, pre-launch
+                    pf_probe_n++;
+                    // find the consuming split's weights input source to compare against the slot
+                    for (int i = 0; i < split->n_inputs; i++) {
+                        ggml_tensor * cand_cpy = tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy);
+                        if (cand_cpy != prefetch_input_cpy) continue;
+                        const size_t probe_n = 4096;
+                        const size_t off = (ggml_nbytes(cand_cpy) / 2) & ~(size_t) 63; // middle window
+                        static uint8_t dev_b[probe_n]; // probe buffer (debug only)
+                        ggml_backend_synchronize(sched->prefetch_backend);
+                        ggml_backend_tensor_get(prefetch_input_cpy, dev_b, off, probe_n);
+                        const uint8_t * host_b = (const uint8_t *) split->inputs[i]->data + off;
+                        int mismatch = -1;
+                        for (size_t b = 0; b < probe_n; b++) {
+                            if (dev_b[b] != host_b[b]) { mismatch = (int) b; break; }
+                        }
+                        fprintf(stderr, "PFDBG slot-content@consume split=%d %s off=%zu first-mismatch=%d dev[0..7]=",
+                            split_id, split->inputs[i]->name, off, mismatch);
+                        for (int b = 0; b < 8; b++) fprintf(stderr, "%02x", dev_b[b]);
+                        fprintf(stderr, " host[0..7]=");
+                        for (int b = 0; b < 8; b++) fprintf(stderr, "%02x", host_b[b]);
+                        fprintf(stderr, "\n");
+                        break;
+                    }
+                } else if (pf_dbg2 && pf_probe_n < 24) {
+                    pf_probe_n++;
+                }
+            }
             for (int i = 0; i < split->n_inputs; i++) {
                 if (tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy) == prefetch_input_cpy) {
                     lookahead_input_id = i;
@@ -2198,7 +2270,46 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (input_id == lookahead_input_id) continue; // H2D already fired via lookahead
+            if (input_id == lookahead_input_id) {
+                if (pf_dbg && pf_dbg_n < 400) {
+                    pf_dbg_n++;
+                    fprintf(stderr, "PFDBG consume-skip split=%d input_id=%d cpy=%p data-at-launch=%p slot=%d\n",
+                        split_id, input_id, (void *) prefetch_input_cpy, prefetch_input_cpy->data, split_prefetch_slot);
+                }
+                // Token-tiled MoE chains put later MUL_MAT_ID consumers of the SAME weights
+                // copy in LATER splits, and those splits' kernels read input_cpy at its
+                // copy-buffer address (the scheduler lists the weights as an input of the
+                // first consumer split only). The prefetch uploaded into the slot and this
+                // split reads the slot -- but the copy buffer would stay unwritten, so the
+                // later splits would read stale bytes. Backfill the copy buffer with a
+                // device-to-device copy from the slot, ordered on the compute stream after
+                // the upload (event wait below) and before any later consumer's kernels:
+                // every reader then sees exactly the uploaded weights either way.
+                int pf_consumers = 1;
+                for (auto & kv : sched->mmid_n_consumers) {
+                    if (kv.w == prefetch_input_cpy) { pf_consumers = kv.consumers; break; }
+                }
+                if (pf_consumers > 1) {
+                    if (pf_dbg && pf_dbg_n < 500) {
+                        pf_dbg_n++;
+                        fprintf(stderr, "PFDBG d2d-backfill split=%d slot=%d consumers=%d n=%zu\n",
+                            split_id, split_prefetch_slot, pf_consumers, ggml_nbytes(prefetch_input_cpy));
+                    }
+                    ggml_backend_event_wait(split_backend, sched->prefetch_ready[split_prefetch_slot]);
+                    const size_t pf_n = ggml_nbytes(prefetch_input_cpy);
+                    ggml_tensor pf_s = {};
+                    pf_s.type = GGML_TYPE_I8;
+                    pf_s.buffer = prefetch_input_cpy->buffer;
+                    pf_s.data = prefetch_input_cpy->data;
+                    pf_s.ne[0] = (int64_t) pf_n; pf_s.ne[1] = pf_s.ne[2] = pf_s.ne[3] = 1;
+                    pf_s.nb[0] = 1; pf_s.nb[1] = pf_s.nb[2] = pf_s.nb[3] = pf_n;
+                    ggml_tensor pf_d = pf_s;
+                    pf_d.buffer = prefetch_saved_buffer;
+                    pf_d.data = prefetch_saved_data;
+                    ggml_backend_tensor_copy_async(split_backend, split_backend, &pf_s, &pf_d);
+                }
+                continue; // H2D already fired via lookahead
+            }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -2242,7 +2353,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy) {
                         const ggml_tensor * ids = node->src[2];
                         const int64_t n_expert = input->ne[2];
-                        if (ids->ne[0]*ids->ne[1] >= 2*n_expert &&
+                        // same batch-size gate as try_fire_prefetch: below prefetch_min_tokens
+                        // the ids-driven used-experts copy moves fewer bytes over PCIe
+                        int64_t pf_batch_tokens = 0;
+                        for (auto & kv : sched->mmid_n_consumers) {
+                            if (kv.w == input_cpy) { pf_batch_tokens = kv.tokens; break; }
+                        }
+                        const bool pf_above_min = sched->prefetch_min_tokens <= 0 ||
+                            pf_batch_tokens >= sched->prefetch_min_tokens;
+                        if (pf_above_min && ids->ne[0]*ids->ne[1] >= 2*n_expert &&
                             ggml_backend_sched_prefetch_init(sched, split_backend, ggml_nbytes(input))) {
                             const int slot = sched->prefetch_cur;
                             sched->prefetch_cur = (sched->prefetch_cur + 1) % sched->prefetch_n_slots;
@@ -2264,6 +2383,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // overlaps with compute. The consumer side has its own event
                             // synchronization right before graph launch to ensure data is ready.
                             split_prefetch_slot = slot;
+                            if (pf_dbg && pf_dbg_n < 400) {
+                                pf_dbg_n++;
+                                fprintf(stderr, "PFDBG fire-inline split=%d %s slot=%d cpy=%p data=%p n=%zu\n",
+                                    split_id, input->name, slot, (void *) input_cpy, input_cpy->data, ggml_nbytes(input));
+                            }
+                            // same multi-consumer backfill as the lookahead consume path above:
+                            // later splits read input_cpy at its copy-buffer address
+                            int pf_consumers = 1;
+                            for (auto & kv : sched->mmid_n_consumers) {
+                                if (kv.w == input_cpy) { pf_consumers = kv.consumers; break; }
+                            }
+                            if (pf_consumers > 1) {
+                                ggml_backend_event_wait(split_backend, sched->prefetch_ready[slot]);
+                                const size_t pf_n = ggml_nbytes(input_cpy);
+                                ggml_tensor pf_s = {};
+                                pf_s.type = GGML_TYPE_I8;
+                                pf_s.buffer = input_cpy->buffer;
+                                pf_s.data = input_cpy->data;
+                                pf_s.ne[0] = (int64_t) pf_n; pf_s.ne[1] = pf_s.ne[2] = pf_s.ne[3] = 1;
+                                pf_s.nb[0] = 1; pf_s.nb[1] = pf_s.nb[2] = pf_s.nb[3] = pf_n;
+                                ggml_tensor pf_d = pf_s;
+                                pf_d.buffer = prefetch_saved_buffer;
+                                pf_d.data = prefetch_saved_data;
+                                ggml_backend_tensor_copy_async(split_backend, split_backend, &pf_s, &pf_d);
+                            }
                             continue;
                         }
                     }
@@ -2285,7 +2429,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_buffer_is_host(input->buffer) &&
                     node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy) {
                     for (auto & kv : sched->mmid_n_consumers) {
-                        if (kv.first == input_cpy && kv.second > 1) { mmid_multi = true; break; }
+                        if (kv.w == input_cpy && kv.consumers > 1) { mmid_multi = true; break; }
                     }
                 }
                 if (mmid_multi) {
@@ -2297,6 +2441,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_synchronize(input_backend);
                         ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                         sched->weights_full_copied.push_back(input_cpy);
+                        if (pf_dbg && pf_dbg_n < 400) {
+                            pf_dbg_n++;
+                            fprintf(stderr, "PFDBG mmid_multi-full split=%d %s cpy=%p data=%p n=%zu consumers>1\n",
+                                split_id, input->name, (void *) input_cpy, input_cpy->data, ggml_nbytes(input));
+                        }
+                    } else if (pf_dbg && pf_dbg_n < 400) {
+                        pf_dbg_n++;
+                        fprintf(stderr, "PFDBG mmid_multi-already split=%d %s cpy=%p data=%p\n",
+                            split_id, input->name, (void *) input_cpy, input_cpy->data);
                     }
                     continue;
                 }
@@ -2594,6 +2747,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
             if (split_prefetch_slot != -1) {
                 // the kernels have captured the slot address at launch, safe to restore
+                if (pf_dbg && pf_dbg_n < 400) {
+                    pf_dbg_n++;
+                    fprintf(stderr, "PFDBG restore split=%d slot=%d cpy=%p data-at-launch=%p -> restore %p\n",
+                        split_id, split_prefetch_slot, (void *) prefetch_input_cpy, prefetch_input_cpy->data,
+                        prefetch_saved_data);
+                    if (pf_dbg2 && pf_probe2_n < 24) { // post-launch slot check: catch early overwrite by the next fire
+                        pf_probe2_n++;
+                        const size_t probe_n = 1024;
+                        const size_t off = (ggml_nbytes(prefetch_input_cpy) / 2) & ~(size_t) 63;
+                        static uint8_t dev_b2[probe_n];
+                        ggml_backend_synchronize(split_backend);
+                        ggml_backend_synchronize(sched->prefetch_backend);
+                        ggml_backend_tensor_get(prefetch_input_cpy, dev_b2, off, probe_n);
+                        fprintf(stderr, "PFDBG slot-content@restore split=%d slot=%d off=%zu dev[0..7]=",
+                            split_id, split_prefetch_slot, off);
+                        for (int b = 0; b < 8; b++) fprintf(stderr, "%02x", dev_b2[b]);
+                        fprintf(stderr, "\n");
+                    }
+                }
                 ggml_backend_event_record(sched->prefetch_free[split_prefetch_slot], split_backend);
                 sched->prefetch_used[split_prefetch_slot] = true;
                 prefetch_input_cpy->buffer = prefetch_saved_buffer;
@@ -2767,6 +2939,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->prefetch_wait_mode = 0;
     sched->prefetch_n_slots   = 2;
     sched->prefetch_cur       = 0;
+    sched->prefetch_min_tokens = 0;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2832,6 +3005,12 @@ void ggml_backend_sched_set_prefetch_experts_slots(ggml_backend_sched_t sched, i
     sched->prefetch_n_slots   = slots;
     sched->prefetch_lookahead = 1; // measured-optimal (mindcontrol prefetch-wait A/B verdict)
     sched->prefetch_wait_mode = 1; // per-split wait: only mode that preserves tool_calls
+}
+
+void ggml_backend_sched_set_prefetch_min_tokens(ggml_backend_sched_t sched, int64_t min_tokens) {
+    if (sched == NULL) { return; }
+    // 0 or negative disables the gate (always prefetch qualifying splits)
+    sched->prefetch_min_tokens = min_tokens > 0 ? min_tokens : 0;
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {

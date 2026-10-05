@@ -382,6 +382,9 @@ extern "C" {
     //   slots >= 2  -> prefetch enabled with 1-deep lookahead and per-split cross-stream wait;
     //                  GPU staging cost = slots * max_expert_tensor. Capped at GGML_SCHED_MAX_PREFETCH_SLOTS.
     GGML_API void                 ggml_backend_sched_set_prefetch_experts_slots(ggml_backend_sched_t sched, int slots);
+    // Full-tensor prefetch fires only for batches of at least min_tokens tokens (0 = no gate);
+    // the context sets n_ubatch/2 — below that the ids-driven used-experts copy moves fewer bytes.
+    GGML_API void                 ggml_backend_sched_set_prefetch_min_tokens(ggml_backend_sched_t sched, int64_t min_tokens);
 
     //
     // Meta backend
