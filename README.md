@@ -8,6 +8,7 @@
 - 修复对GLM-5.3-Flash 1M上下文和大batch叠加的支持，降低长输入对PCIE带宽的依赖
 - 保留热门专家缓存机制，降低cpu计算量
 - 分段选择prefill、decode计算方式，提高不同上下文背景下的速度
+- 长文本纯显卡prefill时，通过分段调节的权重预取提速
 
 ## 1. 测试数据
 
@@ -110,9 +111,57 @@ env CUDA_VISIBLE_DEVICES=<GPU UUID> \
 
 </details>
 
+<details>
+<summary><b>CMP 170HX 62 GB（PCIe 2.0）· EPYC 7642 · GLM-5.3-Flash Q4_K_M · 1M 上下文 · 权重预取</b></summary>
+
+### 测试环境
+
+| 项目 | 配置 |
+| --- | --- |
+| GPU | CMP 170HX 62 GB，PCIe 2.0 |
+| CPU / 内存 | EPYC 7642（48 核），8 通道 DDR4-2133，实测约 100 GB/s |
+| 模型 | GLM-5.3-Flash Uncensored Q4_K_M（179.7 GB，4.81 BPW） |
+| 推理形态 | 非专家权重与 KV（q8_0）驻 GPU；路由专家驻 CPU 内存；44 专家缓存槽/层 + 3 权重预取槽 |
+| 服务参数 | 上下文 1,048,576；batch 16,384；并发 1 |
+
+### 性能
+
+完整阶梯测量，同一会话，每点输入后生成 128 token：
+
+| 输入长度 (token) | Prefill (token/s) | Decode (token/s) |
+| ---: | ---: | ---: |
+| 64 | 52.16 | 16.45 |
+| 256 | 74.55 | 16.81 |
+| 1,024 | 49.12 | 15.76 |
+| 4,096 | 156.93 | 15.30 |
+| 16,384 | 405.62 | 16.23 |
+| 65,536 | 407.50 | 16.29 |
+| 262,144 | 290.01 | 15.40 |
+
+显存：1M 上下文全额预留（q8_0 KV）+ 44 槽专家缓存 + 3 预取槽 + 视觉适配器，空闲 53.8 GB（预取槽懒分配，首个 ≥8,192 token 批后 +5.9 GB），实测峰值 61.5 / 62 GB。
+
+### 启动命令
+
+```bash
+env CUDA_VISIBLE_DEVICES=<GPU UUID> \
+    GGML_SCHED_H2D_ASYNC=1 \
+    LLAMA_MOE_CACHE_MAX_BATCH=512 \
+    GGML_DSA_SCATTER_TILE=512 \
+    ./build-release/bin/llama-server \
+    -m <模型路径>/GLM-5.3-Flash-Uncensored-Q4_K_M-00001-of-00005.gguf \
+    --mmproj <模型路径>/mmproj-GLM-5.3-Flash-Uncensored-F16.gguf \
+    -ngl 99 --cpu-moe --moe cache=44,prefetch-slots=3 -fa on -np 1 \
+    -c 1048576 -ctk q8_0 -ctv q8_0 -t 48 -b 16384 -ub 16384 \
+    --host 0.0.0.0 --port 8300 --alias glm53f --jinja
+```
+
+环境变量同 4090D 组。`cache=44,prefetch-slots=3`：44 为每层缓存槽数、3 为预取槽（10 个缓存槽换 3 个预取槽）；预取只对 ≥ batch/2（8,192 token）的批生效——大批下几乎所有专家都会被用到，全量上传可与 GPU 计算重叠，更小批保持按需拷贝以少传未用专家。
+
+</details>
+
 ## 2. 显存占用估算
 
-显存 ≈ GPU 驻留权重 + KV 缓存 + KDA 循环状态 + 视觉适配器 + k16 转换缓存 + 专家缓存 + 计算池：
+显存 ≈ GPU 驻留权重 + KV 缓存 + KDA 循环状态 + 视觉适配器 + k16 转换缓存 + 专家缓存 + 权重预取 + 计算池：
 
 | 分项 | 决定参数 | 估算（Q4_K_M + q8_0 KV） |
 | --- | --- | --- |
@@ -122,16 +171,18 @@ env CUDA_VISIBLE_DEVICES=<GPU UUID> \
 | 视觉 | --mmproj | 1.2 GB（f16 mmproj） |
 | k16 转换缓存 | 上下文（`-c`） | ≈ 1.45 KiB/token（仅量化 KV 时存在） |
 | 专家缓存 | 缓存槽数（`--moe cache=N`） | ≈ 0.59 GB/槽（Q4_K_M） |
+| 权重预取 | 预取槽数（`--moe prefetch-slots=N`，≥2 启用） | ≈ 1.84 GB/槽 + 0.24 GB 固定（Q4_K_M，懒分配） |
 | 计算池 | `-ub` 为主，弱 `-c` 项 | ≈ 0.28 MB/token × `-ub` + 1 KiB/token × `-c` |
 | 其他 | — | ≈ 0.5 GB |
 
 显存不足时的调节：
 
 1. **缓存槽数**（`--moe cache=N`）：降低影响decode速度
-2. **batch**（`-b`/`-ub`）：影响长单次输入prefill速度，4090+pcie3推荐16384,推荐值和算力正比、和pcie带宽反比
-3. **上下文**（`-c`）
+2. **权重预取**（`--moe prefetch-slots=N`，≥2 启用）：降低影响prefill速度
+3. **batch**（`-b`/`-ub`）：影响长单次输入prefill速度，4090+pcie3推荐16384,推荐值和算力正比、和pcie带宽反比
+4. **上下文**（`-c`）
 
-实测锚点：1M 上下文 + 6 槽 + 65,536 批 → 空闲 44.6 GB，满载峰值 46.9 GB。
+实测锚点：1M 上下文 + 6 槽 + 65,536 批 → 空闲 44.6 GB，满载峰值 46.9 GB。启用预取（170HX：44 槽 + 3 预取槽）→ 空闲 53.8 GB（槽懒分配未触发）；16k 批峰值 60.4 GB、69k 批峰值 61.5 GB（62 GB 预算内）。
 
 ## 3. 路径路由
 
@@ -150,6 +201,14 @@ DSA 层按批次形状在三条执行路径间选择，与运行配置无关。�
 | 多序列 / 视觉（2d-rope） | 任意 | gather | scatter 路径仅支持单序列、一维位置 |
 
 索引打分在 池数 × token 数 > 2²⁴ 时切换为（上下文块 × token 片）分块计算 + 滚动 top-k 归并，更小负载保持单块路径。该机制是 1M 上下文峰值显存恒定的直接原因。
+
+专家权重传输（`--cpu-moe` 下专家驻 CPU 内存，逐层过 PCIe）按微批大小分三路，分界 batch/2 随 `-ub` 缩放：
+
+| 微批 (token) | 传输路径 | 原因 |
+| --- | --- | --- |
+| ≤ 512 | 专家缓存图：命中读 GPU 槽，miss 由 CPU 计算并异步上传 | 与 decode 同路，短批时序局部性高 |
+| 512 < n < batch/2 | 按需拷贝：等本层路由 ids 确定后只传用到的专家，与计算同流串行 | 小批路由倾斜，用集仅 70–85%（1k/4k 实测），少传字节胜过重叠 |
+| ≥ batch/2 | 全量预取：独立流 + slot 提前传整张量，与 GPU 计算重叠；分块链后续 tile 由 D2D 回填 | 大批用集≈全量，整传无额外字节，重叠收益全兑现（16k 实测 +44%） |
 
 ## 4. 优化内容
 

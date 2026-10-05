@@ -68,6 +68,7 @@
   <li><span class="zh">修复对 GLM-5.3-Flash 1M 上下文和大 batch 叠加的支持，降低长输入对 PCIE 带宽的依赖</span><span class="en">Fixed GLM-5.3-Flash support for 1M context combined with large batches, reducing long inputs' dependence on PCIe bandwidth</span></li>
   <li><span class="zh">保留热门专家缓存机制，降低 cpu 计算量</span><span class="en">Keeps the hot-expert cache, reducing CPU compute</span></li>
   <li><span class="zh">分段选择 prefill、decode 计算方式，提高不同上下文背景下的速度</span><span class="en">Selects prefill/decode execution paths by shape, improving speed across context lengths</span></li>
+  <li><span class="zh">长文本纯显卡 prefill 时，通过分段调节的权重预取提速</span><span class="en">Weight prefetch, engaged in stages, speeds up long-input all-GPU prefill</span></li>
 </ul>
 
 <h2 id="bench"><span class="zh">1. 测试数据</span><span class="en">1. Benchmarks</span></h2>
@@ -157,8 +158,50 @@
 
 </details>
 
+<details>
+<summary><b>CMP 170HX 62 GB（PCIe 2.0）· EPYC 7642 · GLM-5.3-Flash Q4_K_M · 1M · <span class="zh">权重预取</span><span class="en">Weight prefetch</span></b></summary>
+
+<h3><span class="zh">测试环境</span><span class="en">Environment</span></h3>
+<table>
+  <tr><th><span class="zh">项目</span><span class="en">Item</span></th><th><span class="zh">配置</span><span class="en">Configuration</span></th></tr>
+  <tr><td>GPU</td><td><span class="zh">CMP 170HX 62 GB，PCIe 2.0</span><span class="en">CMP 170HX 62 GB, PCIe 2.0</span></td></tr>
+  <tr><td><span class="zh">CPU / 内存</span><span class="en">CPU / RAM</span></td><td><span class="zh">EPYC 7642（48 核），8 通道 DDR4-2133，实测约 100 GB/s</span><span class="en">EPYC 7642 (48 cores), 8-channel DDR4-2133, ~100 GB/s measured</span></td></tr>
+  <tr><td><span class="zh">模型</span><span class="en">Model</span></td><td><span class="zh">GLM-5.3-Flash Uncensored Q4_K_M（179.7 GB，4.81 BPW）</span><span class="en">GLM-5.3-Flash Uncensored Q4_K_M (179.7 GB, 4.81 BPW)</span></td></tr>
+  <tr><td><span class="zh">推理形态</span><span class="en">Inference form</span></td><td><span class="zh">非专家权重与 KV（q8_0）驻 GPU；路由专家驻 CPU 内存；44 专家缓存槽/层 + 3 权重预取槽</span><span class="en">Non-expert weights and KV (q8_0) on GPU; routed experts in CPU RAM; 44 expert-cache slots per layer + 3 weight-prefetch slots</span></td></tr>
+  <tr><td><span class="zh">服务参数</span><span class="en">Server</span></td><td><span class="zh">上下文 1,048,576；batch 16,384；并发 1</span><span class="en">Context 1,048,576; batch 16,384; concurrency 1</span></td></tr>
+</table>
+
+<h3><span class="zh">性能</span><span class="en">Performance</span></h3>
+<p><span class="zh">完整阶梯测量，同一会话，每点输入后生成 128 token：</span><span class="en">Full ladder, one session, 128 tokens generated per point:</span></p>
+<table>
+  <tr><th><span class="zh">输入长度 (token)</span><span class="en">Input length (tokens)</span></th><th class="num">Prefill (token/s)</th><th class="num">Decode (token/s)</th></tr>
+  <tr><td class="num">64</td><td class="num">52.16</td><td class="num">16.45</td></tr>
+  <tr><td class="num">256</td><td class="num">74.55</td><td class="num">16.81</td></tr>
+  <tr><td class="num">1,024</td><td class="num">49.12</td><td class="num">15.76</td></tr>
+  <tr><td class="num">4,096</td><td class="num">156.93</td><td class="num">15.30</td></tr>
+  <tr><td class="num">16,384</td><td class="num">405.62</td><td class="num">16.23</td></tr>
+  <tr><td class="num">65,536</td><td class="num">407.50</td><td class="num">16.29</td></tr>
+  <tr><td class="num">262,144</td><td class="num">290.01</td><td class="num">15.40</td></tr>
+</table>
+<p><span class="zh">显存：1M 上下文全额预留（q8_0 KV）+ 44 槽专家缓存 + 3 预取槽 + 视觉适配器，空闲 53.8 GB（预取槽懒分配，首个 ≥8,192 token 批后 +5.9 GB），实测峰值 61.5 / 62 GB。</span><span class="en">VRAM: full 1M-context reservation (q8_0 KV) + 44-slot expert cache + 3 prefetch slots + vision adapter, 53.8 GB idle (prefetch slots lazily allocated, +5.9 GB after the first batch of ≥8,192 tokens), measured peak 61.5 / 62 GB.</span></p>
+
+<h3><span class="zh">启动命令</span><span class="en">Launch command</span></h3>
+<pre><code>env CUDA_VISIBLE_DEVICES=&lt;GPU UUID&gt; \
+    GGML_SCHED_H2D_ASYNC=1 \
+    LLAMA_MOE_CACHE_MAX_BATCH=512 \
+    GGML_DSA_SCATTER_TILE=512 \
+    ./build-release/bin/llama-server \
+    -m &lt;model path&gt;/GLM-5.3-Flash-Uncensored-Q4_K_M-00001-of-00005.gguf \
+    --mmproj &lt;model path&gt;/mmproj-GLM-5.3-Flash-Uncensored-F16.gguf \
+    -ngl 99 --cpu-moe --moe cache=44,prefetch-slots=3 -fa on -np 1 \
+    -c 1048576 -ctk q8_0 -ctv q8_0 -t 48 -b 16384 -ub 16384 \
+    --host 0.0.0.0 --port 8300 --alias glm53f --jinja</code></pre>
+<p><span class="zh">环境变量同 4090D 组。<code>cache=44,prefetch-slots=3</code>：44 为每层缓存槽数、3 为预取槽（10 个缓存槽换 3 个预取槽）；预取只对 ≥ batch/2（8,192 token）的批生效——大批下几乎所有专家都会被用到，全量上传可与 GPU 计算重叠，更小批保持按需拷贝以少传未用专家。</span><span class="en">Environment variables as in the 4090D group. <code>cache=44,prefetch-slots=3</code>: 44 cache slots per layer and 3 prefetch slots (10 cache slots traded for 3 prefetch slots); prefetch engages only for batches of ≥ batch/2 (8,192 tokens) — at large batches virtually every expert is used, so the full upload overlaps GPU compute, while smaller batches keep the on-demand copy that skips unused experts.</span></p>
+
+</details>
+
 <h2 id="vram"><span class="zh">2. 显存占用估算</span><span class="en">2. VRAM estimation</span></h2>
-<p><span class="zh">显存 ≈ GPU 驻留权重 + KV 缓存 + KDA 循环状态 + 视觉适配器 + k16 转换缓存 + 专家缓存 + 计算池：</span><span class="en">VRAM ≈ GPU-resident weights + KV cache + KDA recurrent state + vision adapter + k16 conversion cache + expert cache + compute pool:</span></p>
+<p><span class="zh">显存 ≈ GPU 驻留权重 + KV 缓存 + KDA 循环状态 + 视觉适配器 + k16 转换缓存 + 专家缓存 + 权重预取 + 计算池：</span><span class="en">VRAM ≈ GPU-resident weights + KV cache + KDA recurrent state + vision adapter + k16 conversion cache + expert cache + weight prefetch + compute pool:</span></p>
 <table>
   <tr><th><span class="zh">分项</span><span class="en">Component</span></th><th><span class="zh">决定参数</span><span class="en">Decided by</span></th><th><span class="zh">估算（Q4_K_M + q8_0 KV）</span><span class="en">Estimate (Q4_K_M + q8_0 KV)</span></th></tr>
   <tr><td><span class="zh">非专家权重</span><span class="en">Non-expert weights</span></td><td><span class="zh">模型</span><span class="en">model</span></td><td>8.7 GB（Q4_K_M）</td></tr>
@@ -167,16 +210,18 @@
   <tr><td><span class="zh">视觉</span><span class="en">Vision</span></td><td>--mmproj</td><td>1.2 GB（f16 mmproj）</td></tr>
   <tr><td><span class="zh">k16 转换缓存</span><span class="en">k16 conversion cache</span></td><td><span class="zh">上下文（<code>-c</code>）</span><span class="en">context (<code>-c</code>)</span></td><td><span class="zh">≈ 1.45 KiB/token（仅量化 KV 时存在）</span><span class="en">≈ 1.45 KiB/token (exists only with quantized KV)</span></td></tr>
   <tr><td><span class="zh">专家缓存</span><span class="en">Expert cache</span></td><td><span class="zh">缓存槽数（<code>--moe cache=N</code>）</span><span class="en">slot count (<code>--moe cache=N</code>)</span></td><td>≈ 0.59 GB/槽（Q4_K_M）</td></tr>
+  <tr><td><span class="zh">权重预取</span><span class="en">Weight prefetch</span></td><td><span class="zh">预取槽数（<code>--moe prefetch-slots=N</code>，≥2 启用）</span><span class="en">prefetch slot count (<code>--moe prefetch-slots=N</code>, enabled at ≥2)</span></td><td><span class="zh">≈ 1.84 GB/槽 + 0.24 GB 固定（Q4_K_M，懒分配）</span><span class="en">≈ 1.84 GB/slot + 0.24 GB fixed (Q4_K_M, lazily allocated)</span></td></tr>
   <tr><td><span class="zh">计算池</span><span class="en">Compute pool</span></td><td><span class="zh"><code>-ub</code> 为主，弱 <code>-c</code> 项</span><span class="en">mostly <code>-ub</code>, weak <code>-c</code> term</span></td><td>≈ 0.28 MB/token × <code>-ub</code> + 1 KiB/token × <code>-c</code></td></tr>
   <tr><td><span class="zh">其他</span><span class="en">Other</span></td><td>—</td><td>≈ 0.5 GB</td></tr>
 </table>
 <p><span class="zh">显存不足时的调节：</span><span class="en">When VRAM runs short, adjust in this order:</span></p>
 <ol>
   <li><span class="zh"><b>缓存槽数</b>（<code>--moe cache=N</code>）：降低影响 decode 速度</span><span class="en"><b>Cache slots</b> (<code>--moe cache=N</code>): lowering only affects decode speed</span></li>
+  <li><span class="zh"><b>权重预取</b>（<code>--moe prefetch-slots=N</code>，≥2 启用）：降低影响prefill速度</span><span class="en"><b>Weight prefetch</b> (<code>--moe prefetch-slots=N</code>, N≥2 enables): lowering only affects prefill speed</span></li>
   <li><span class="zh"><b>batch</b>（<code>-b</code>/<code>-ub</code>）：影响长单次输入 prefill 速度，4090+pcie3 推荐 16384，推荐值和算力正比、和 pcie 带宽反比</span><span class="en"><b>Batch</b> (<code>-b</code>/<code>-ub</code>): affects long-single-input prefill speed; 16384 recommended on a 4090 + PCIe 3.0 — the recommended value scales with compute and inversely with PCIe bandwidth</span></li>
   <li><span class="zh"><b>上下文</b>（<code>-c</code>）</span><span class="en"><b>Context</b> (<code>-c</code>)</span></li>
 </ol>
-<p><span class="zh">实测锚点：1M 上下文 + 6 槽 + 65,536 批 → 空闲 44.6 GB，满载峰值 46.9 GB。</span><span class="en">Measured anchors: 1M context + 6 slots + batch 65,536 → 44.6 GB idle, 46.9 GB peak.</span></p>
+<p><span class="zh">实测锚点：1M 上下文 + 6 槽 + 65,536 批 → 空闲 44.6 GB，满载峰值 46.9 GB。启用预取（170HX：44 槽 + 3 预取槽）→ 空闲 53.8 GB（槽懒分配未触发）；16k 批峰值 60.4 GB、69k 批峰值 61.5 GB（62 GB 预算内）。</span><span class="en">Measured anchors: 1M context + 6 slots + batch 65,536 → 44.6 GB idle, 46.9 GB peak. With prefetch enabled (170HX: 44 cache + 3 prefetch slots) → 53.8 GB idle before the first large batch (lazy allocation); peaks of 60.4 GB at 16k and 61.5 GB at 69k, within the 62 GB budget.</span></p>
 
 <h2 id="routing"><span class="zh">3. 路径路由</span><span class="en">3. Path routing</span></h2>
 <p><span class="zh">DSA 层按批次形状在三条执行路径间选择，与运行配置无关。两个阈值：</span><span class="en">The DSA layers pick one of three execution paths by batch shape alone, independent of configuration. Two thresholds:</span></p>
@@ -194,6 +239,13 @@
   <tr><td><span class="zh">多序列 / 视觉（2d-rope）</span><span class="en">multi-sequence / vision (2d-rope)</span></td><td><span class="zh">任意</span><span class="en">any</span></td><td>gather</td><td><span class="zh">scatter 路径仅支持单序列、一维位置</span><span class="en">the scatter forms support one sequence with 1d positions only</span></td></tr>
 </table>
 <p><span class="zh">索引打分在 池数 × token 数 &gt; 2<sup>24</sup> 时切换为（上下文块 × token 片）分块计算 + 滚动 top-k 归并，更小负载保持单块路径。该机制是 1M 上下文峰值显存恒定的直接原因。</span><span class="en">Indexer scoring switches to (context-chunk × token-tile) blocks with a running top-k merge once pools × tokens &gt; 2<sup>24</sup>; smaller workloads keep the monolithic path. This mechanism is what keeps peak VRAM flat at 1M context.</span></p>
+<p><span class="zh">专家权重传输（<code>--cpu-moe</code> 下专家驻 CPU 内存，逐层过 PCIe）按微批大小分三路，分界 batch/2 随 <code>-ub</code> 缩放：</span><span class="en">Expert-weight transport (with <code>--cpu-moe</code> the experts live in CPU RAM and cross PCIe layer by layer) has three routes by micro-batch size; the batch/2 boundary scales with <code>-ub</code>:</span></p>
+<table>
+  <tr><th><span class="zh">微批 (token)</span><span class="en">Micro-batch (tokens)</span></th><th><span class="zh">传输路径</span><span class="en">Transport route</span></th><th><span class="zh">原因</span><span class="en">Why</span></th></tr>
+  <tr><td class="num">≤ 512</td><td><span class="zh">专家缓存图：命中读 GPU 槽，miss 由 CPU 计算并异步上传</span><span class="en">expert-cache graph: hits read GPU slots, misses computed on CPU and uploaded async</span></td><td><span class="zh">与 decode 同路，短批时序局部性高</span><span class="en">same route as decode; short batches have strong temporal locality</span></td></tr>
+  <tr><td><span class="zh">512 &lt; n &lt; batch/2</span><span class="en">512 &lt; n &lt; batch/2</span></td><td><span class="zh">按需拷贝：等本层路由 ids 确定后只传用到的专家，与计算同流串行</span><span class="en">on-demand copy: waits for the layer's routing ids and copies only the used experts, serialized with compute on one stream</span></td><td><span class="zh">小批路由倾斜，用集仅 70–85%（1k/4k 实测），少传字节胜过重叠</span><span class="en">routing is skewed at small batches, the used set is only 70–85% (measured at 1k/4k) — fewer bytes beat overlap</span></td></tr>
+  <tr><td><span class="zh">≥ batch/2</span><span class="en">≥ batch/2</span></td><td><span class="zh">全量预取：独立流 + slot 提前传整张量，与 GPU 计算重叠；分块链后续 tile 由 D2D 回填</span><span class="en">full-tensor prefetch: a separate stream with staging slots uploads ahead and overlaps GPU compute; later tiles of a tiled chain are backfilled D2D</span></td><td><span class="zh">大批用集≈全量，整传无额外字节，重叠收益全兑现（16k 实测 +44%）</span><span class="en">at large batches the used set ≈ everything, the full upload costs no extra bytes and the overlap pays in full (+44% measured at 16k)</span></td></tr>
+</table>
 
 <h2 id="opt"><span class="zh">4. 优化内容</span><span class="en">4. Optimizations</span></h2>
 
