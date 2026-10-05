@@ -7,6 +7,8 @@
 - 保留热门专家缓存机制，降低cpu计算量
 - 分段选择prefill、decode计算方式，提高不同上下文背景下的速度
 
+**在线页面**：<https://xxianna.github.io/llama.cpp/>（GitHub Pages；内容与本节同步，见 `docs/index.html`）
+
 ## 1. 测试数据
 
 <details>
